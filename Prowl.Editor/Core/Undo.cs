@@ -1,0 +1,997 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+using Prowl.Echo;
+using Prowl.Editor.GUI.SceneView;
+using Prowl.Runtime;
+using Prowl.Runtime.Resources;
+using Prowl.Vector;
+
+namespace Prowl.Editor.Core;
+
+/// <summary>
+/// Central undo/redo system for the editor.
+/// Supports property changes (via Echo serialization), structural changes (create/delete GO),
+/// and generic action-based undo via lambdas.
+/// </summary>
+public static class Undo
+{
+    // ================================================================
+    //  Data Structures
+    // ================================================================
+
+    private abstract class UndoRecord
+    {
+        public abstract void PerformUndo();
+        public abstract void PerformRedo();
+    }
+
+    /// <summary>
+    /// Records a property change on a serializable object (typically Component).
+    /// Stores before/after EchoObject snapshots. Restores by copying fields onto the live object.
+    /// Tracks targets by Identifier (Guid) so records survive destroy/recreate cycles.
+    /// </summary>
+    private class PropertyRecord : UndoRecord
+    {
+        public Type TargetType;
+        public MemoryCopy BeforeState;
+        public MemoryCopy AfterState;
+
+        // Identifier-based tracking for Component targets
+        public Guid ComponentIdentifier;
+        // Fallback for non-Component targets (plain objects)
+        public WeakReference<object>? FallbackRef;
+
+        public PropertyRecord(object target, MemoryCopy before, MemoryCopy after)
+        {
+            TargetType = target.GetType();
+            BeforeState = before;
+            AfterState = after;
+
+            if (target is Component mb)
+                ComponentIdentifier = mb.Identifier;
+            else
+            {
+                ComponentIdentifier = Guid.Empty;
+                FallbackRef = new WeakReference<object>(target);
+            }
+        }
+
+        public override void PerformUndo() => RestoreState(BeforeState);
+        public override void PerformRedo() => RestoreState(AfterState);
+
+        public object? ResolveTarget()
+        {
+            if (ComponentIdentifier != Guid.Empty)
+                return FindComponentByIdentifier(ComponentIdentifier);
+            if (FallbackRef != null && FallbackRef.TryGetTarget(out object? fallback))
+            {
+                if (fallback is EngineObject eo && eo.IsDisposed) return null;
+                return fallback;
+            }
+            return null;
+        }
+
+        private void RestoreState(MemoryCopy copy)
+        {
+            EchoObject state = copy.Data;
+            object? target = ResolveTarget();
+            if (target == null) return;
+
+            // An asset is refilled whole, so everything derived from it sees the change.
+            if (target is Asset { IsFromDatabase: true } asset)
+            {
+                AssetDatabase.Refill(asset, state, ReloadReason.Undo);
+                return;
+            }
+
+            CopyFieldsFromEcho(target, TargetType, state);
+
+            // Restoring writes fields directly, exactly as the property grid does, so the object
+            // needs the same notification an edit gives it. Without this, anything that applies its
+            // fields to live state — a collider's shape, a rigidbody's mass, a nav obstacle's carve —
+            // keeps the value being undone.
+            if (target is EngineObject engineObject && engineObject.IsValid()) engineObject.OnValidate();
+        }
+    }
+
+    /// <summary>
+    /// Records an arbitrary undoable action with explicit undo/redo lambdas.
+    /// Used for GO header fields, transform changes, structural operations, etc.
+    /// </summary>
+    private class ActionRecord : UndoRecord
+    {
+        public Action UndoAction;
+        public Action RedoAction;
+
+        public ActionRecord(Action undo, Action redo)
+        {
+            UndoAction = undo;
+            RedoAction = redo;
+        }
+
+        public override void PerformUndo() => UndoAction();
+        public override void PerformRedo() => RedoAction();
+    }
+
+    /// <summary>
+    /// One user-visible undo step. May contain multiple records
+    /// (e.g., editing multiple selected objects in one frame).
+    /// </summary>
+    private class UndoStep
+    {
+        public string Description;
+        public List<UndoRecord> Records;
+        /// <summary>True if this step contains ONLY PropertyRecords and can be coalesced with the next.</summary>
+        public bool IsCoalescable;
+        /// <summary>When this step was created/last coalesced (milliseconds).</summary>
+        public long Timestamp;
+
+        public UndoStep(string description, List<UndoRecord> records, bool isCoalescable = false)
+        {
+            Description = description;
+            Records = records;
+            IsCoalescable = isCoalescable;
+            Timestamp = Environment.TickCount64;
+        }
+    }
+
+    // ================================================================
+    //  State
+    // ================================================================
+
+    private static readonly List<UndoStep> _undoStack = [];
+    private static readonly List<UndoStep> _redoStack = [];
+
+    // Per-frame pending snapshots: target -> beforeState (captured at start of draw, before any mutations)
+    private static readonly Dictionary<object, MemoryCopy> _pendingSnapshots = [];
+
+    // Immediate action records accumulated this frame (RegisterAction calls)
+    private static readonly List<(string description, UndoRecord record)> _pendingActions = [];
+
+    // Pre-grouped action steps accumulated this frame (RegisterActionGroup calls). Each is ONE undo step
+    // holding many records, so editing N selected objects collapses into a single user-visible step.
+    private static readonly List<(UndoStep step, bool coalesce)> _pendingActionGroups = [];
+
+    // Deferred created/destroy objects serialized at FlushFrame so components added after registration are captured
+    private static readonly List<(GameObject go, string description, bool isCreate)> _pendingStructural = [];
+
+    // Continuous operation state (gizmo drag) tracks by Identifier, not reference
+    private static bool _isContinuous;
+    private static string _continuousDescription = "";
+    private static List<(Guid goId, Float3 pos, Quaternion rot, Float3 scale)>? _continuousStartState;
+
+    // ================================================================
+    //  Configuration
+    // ================================================================
+
+    /// <summary> Maximum number of undo steps kept in the undo stack. Defaults to 100. </summary>
+    public static int MaxSteps { get; set; } = 100;
+
+    // ================================================================
+    //  Events
+    // ================================================================
+
+    /// <summary>Fires after an undo or redo operation completes.</summary>
+    public static event Action? OnUndoRedo;
+
+    // ================================================================
+    //  State Queries
+    // ================================================================
+
+    public static bool CanUndo => _undoStack.Count > 0;
+    public static bool CanRedo => _redoStack.Count > 0;
+    public static bool IsContinuous => _isContinuous;
+
+    /// <summary> Description of the next undo operation, or "Undo" if the stack is empty. </summary>
+    public static string UndoDescription => _undoStack.Count > 0
+        ? $"Undo {_undoStack[^1].Description}"
+        : "Undo";
+
+    /// <summary> Description of the next redo operation, or "Redo" if the stack is empty. </summary>
+    public static string RedoDescription => _redoStack.Count > 0
+        ? $"Redo {_redoStack[^1].Description}"
+        : "Redo";
+
+    // ================================================================
+    //  Property Recording (for Component / plain objects via PropertyGrid)
+    // ================================================================
+
+    /// <summary>
+    /// Snapshot an object's current state for undo. Call at the TOP of PropertyGrid.Draw()
+    /// or custom editor OnGUI(), BEFORE any widgets draw this captures the state before
+    /// any in-place mutations (nested objects, collections, curves, etc.).
+    /// No-op if already snapshotted this frame for the same target.
+    /// </summary>
+    public static void Snapshot(object target)
+    {
+        if (Application.IsPlaying) return;
+        if (target == null) return;
+        if (_isContinuous) return;
+
+        if (!_pendingSnapshots.ContainsKey(target))
+        {
+            _pendingSnapshots[target] = Capture(target);
+        }
+    }
+
+    // ================================================================
+    //  Generic Action Recording
+    // ================================================================
+
+    /// <summary>
+    /// Register an undoable action with explicit undo/redo lambdas.
+    /// </summary>
+    public static void RegisterAction(string description, Action undo, Action redo)
+    {
+        if (Application.IsPlaying) return;
+
+        _pendingActions.Add((description, new ActionRecord(undo, redo)));
+    }
+
+    /// <summary>
+    /// Records a property change on a GameObject, looking the GO back up by Identifier on undo/redo
+    /// so the record survives destroy/recreate cycles. Apply receives the live GO and the value to assign.
+    /// Caller is still responsible for the immediate write - this only registers the undo entry.
+    /// </summary>
+    public static void RecordGameObjectChange<T>(GameObject go, string description, T oldValue, T newValue, Action<GameObject, T> apply, bool coalesce = false)
+    {
+        Guid id = go.Identifier;
+        void undo() { GameObject? g = FindGO(id); if (g != null) apply(g, oldValue); }
+        void redo() { GameObject? g = FindGO(id); if (g != null) apply(g, newValue); }
+        if (coalesce) RegisterCoalescableAction(description, undo, redo);
+        else RegisterAction(description, undo, redo);
+    }
+
+    /// <summary>
+    /// Register an undoable action that coalesces with the previous action if it has the
+    /// same description and is within the time window. Use for continuous text input (Name fields, etc.).
+    /// The undo lambda is kept from the FIRST action; the redo lambda is updated to the LATEST.
+    /// </summary>
+    public static void RegisterCoalescableAction(string description, Action undo, Action redo)
+    {
+        if (Application.IsPlaying) return;
+
+        // Check if we can coalesce with the top of the undo stack
+        if (_pendingActions.Count == 0 && _undoStack.Count > 0)
+        {
+            UndoStep prev = _undoStack[^1];
+            if (prev.Description == description
+                && prev.Records.Count == 1
+                && prev.Records[0] is ActionRecord
+                && Environment.TickCount64 - prev.Timestamp <= CoalesceWindowMs)
+            {
+                // Update redo to latest value, keep original undo
+                prev.Records[0] = new ActionRecord(((ActionRecord)prev.Records[0]).UndoAction, redo);
+                prev.Timestamp = Environment.TickCount64;
+                _redoStack.Clear();
+                return;
+            }
+        }
+
+        // Can't coalesce push as normal action but mark as coalescable
+        _pendingActions.Add((description, new ActionRecord(undo, redo)));
+    }
+
+    /// <summary>
+    /// Register several undo/redo actions as ONE undo step (so editing many selected objects in a single
+    /// interaction collapses to a single undo). When <paramref name="coalesce"/> is true the step merges
+    /// with the previous step if it has the same description and record count within the coalesce window
+    /// (for continuous edits like dragging a multi-object transform field).
+    /// </summary>
+    public static void RegisterActionGroup(string description, IReadOnlyList<(Action undo, Action redo)> actions, bool coalesce = false)
+    {
+        if (Application.IsPlaying) return;
+        if (actions == null || actions.Count == 0) return;
+
+        var records = new List<UndoRecord>(actions.Count);
+        foreach ((Action? u, Action? r) in actions) records.Add(new ActionRecord(u, r));
+        _pendingActionGroups.Add((new UndoStep(description, records, isCoalescable: false), coalesce));
+    }
+
+    /// <summary>
+    /// Apply a value to every given GameObject and record the change as a single grouped undo step.
+    /// Captures each object's current value as the undo state, then writes the new value. Mirrors
+    /// <see cref="RecordGameObjectChange"/> but batched across a multi-object selection.
+    /// </summary>
+    public static void ApplyGameObjectChanges<T>(IReadOnlyList<GameObject> gos, string description,
+        Func<GameObject, T> get, Action<GameObject, T> set, T newValue, bool coalesce = false)
+    {
+        if (Application.IsPlaying)
+        {
+            foreach (GameObject go in gos) set(go, newValue);
+            return;
+        }
+
+        var actions = new List<(Action undo, Action redo)>(gos.Count);
+        foreach (GameObject go in gos)
+        {
+            Guid id = go.Identifier;
+            T oldV = get(go);
+            T captured = newValue;
+            actions.Add((() => { GameObject? g = FindGO(id); if (g != null) set(g, oldV); },
+                         () => { GameObject? g = FindGO(id); if (g != null) set(g, captured); }
+            ));
+            set(go, newValue);
+        }
+        RegisterActionGroup(description, actions, coalesce);
+    }
+
+    // ================================================================
+    //  Structural Operations
+    // ================================================================
+
+    /// <summary>
+    /// Register that a GameObject was just created. Undo will destroy it, redo will recreate it.
+    /// Serialization is deferred to FlushFrame so components added after this call are captured.
+    /// Call AFTER the GO has been added to the scene and parented.
+    /// </summary>
+    public static void RegisterCreatedObject(GameObject go, string description)
+    {
+        if (Application.IsPlaying) return;
+        if (go == null) return;
+
+        _pendingStructural.Add((go, description, isCreate: true));
+    }
+
+    private static void FlushCreatedObject(GameObject go, string description)
+    {
+        (Action? undo, Action? redo) = CaptureCreatedObject(go);
+        _pendingActions.Add((description, new ActionRecord(undo, redo)));
+    }
+
+    /// <summary>
+    /// Build the undo/redo pair for a just-created GameObject without pushing it as its own step,
+    /// so a compound operation can hand it to <see cref="RegisterActionGroup"/> together with the
+    /// follow-up actions that depend on it (e.g. "Create Empty Parent" = new object + reparenting).
+    /// Splitting those across two steps would let the object be destroyed while the objects moved
+    /// under it still live there, taking them down with it.
+    /// Unlike <see cref="RegisterCreatedObject"/> this serializes immediately, so call it while the
+    /// object is still in the state redo should restore it to - before the follow-up actions run.
+    /// </summary>
+    public static (Action undo, Action redo) CaptureCreatedObject(GameObject go)
+    {
+        // The tree by value, anything it references outside itself linked by identifier: without a resolver
+        // Echo would deep copy those scene objects into the snapshot, and undo would restore the object
+        // pointing at orphan clones of whatever it referenced.
+        MemoryCopy copy = SceneReferenceResolver.WriteMemoryCopy(go);
+        Guid goId = go.Identifier;
+        Guid parentId = go.Parent.IsValid() ? go.Parent.Identifier : Guid.Empty;
+        int siblingIndex = go.Parent != null ? go.Parent.Children.IndexOf(go) : -1;
+
+        return (
+            undo: () =>
+            {
+                Scene scene = Scene.Current;
+                if (scene == null) return;
+                GameObject? target = FindGameObjectByIdentifier(scene, goId);
+                if (target == null) return;
+
+                if (Selection.IsSelected(target))
+                    Selection.Clear();
+
+                scene.Remove(target);
+                target.Destroy(); // TODO: Should this be Dispose... or Destroy? Destroy defers it to end of frame?
+            },
+            redo: () =>
+            {
+                Scene scene = Scene.Current;
+                if (scene == null) return;
+
+                // Preserving identifiers: what comes back has to be the object that went away, or
+                // every other record addressing it stops resolving.
+                var restored = GameObject.DeserializePreservingIdentifiers(copy.Data, SceneReferenceResolver.ContextForLinking());
+                if (restored == null) return;
+
+                scene.Add(restored);
+                if (parentId != Guid.Empty)
+                {
+                    GameObject? parent = FindGameObjectByIdentifier(scene, parentId);
+                    if (parent != null)
+                    {
+                        restored.SetParent(parent);
+                        if (siblingIndex >= 0 && siblingIndex < parent.Children.Count)
+                            restored.SetSiblingIndex(siblingIndex);
+                    }
+                }
+
+                Selection.Select(restored);
+                EditorSceneManager.MarkDirty();
+            }
+        );
+    }
+
+    /// <summary>
+    /// Register that a GameObject is about to be destroyed. Undo will recreate it, redo will destroy it.
+    /// Call BEFORE the GO is removed from the scene.
+    /// </summary>
+    public static void RegisterDestroyObject(GameObject go, string description)
+    {
+        if (Application.IsPlaying) return;
+        if (go == null) return;
+
+        // Serialize the entire GO tree before destruction
+        // Linked, not copied: see CaptureCreatedObject.
+        MemoryCopy copy = SceneReferenceResolver.WriteMemoryCopy(go);
+        Guid parentId = go.Parent.IsValid() ? go.Parent.Identifier : Guid.Empty;
+        int siblingIndex = go.Parent != null ? go.Parent.Children.IndexOf(go) : -1;
+        Guid goId = go.Identifier;
+
+        RegisterAction(description,
+            undo: () =>
+            {
+                Scene scene = Scene.Current;
+                if (scene == null) return;
+
+                // Preserving identifiers: what comes back has to be the object that went away, or
+                // every other record addressing it stops resolving.
+                var restored = GameObject.DeserializePreservingIdentifiers(copy.Data, SceneReferenceResolver.ContextForLinking());
+                if (restored == null) return;
+
+                scene.Add(restored);
+                if (parentId != Guid.Empty)
+                {
+                    GameObject? parent = FindGameObjectByIdentifier(scene, parentId);
+                    if (parent != null)
+                    {
+                        restored.SetParent(parent);
+                        if (siblingIndex >= 0 && siblingIndex < parent.Children.Count)
+                            restored.SetSiblingIndex(siblingIndex);
+                    }
+                }
+
+                Selection.Select(restored);
+                EditorSceneManager.MarkDirty();
+            },
+            redo: () =>
+            {
+                Scene scene = Scene.Current;
+                if (scene == null) return;
+                GameObject? target = FindGameObjectByIdentifier(scene, goId);
+                if (target == null) return;
+
+                if (Selection.IsSelected(target))
+                    Selection.Clear();
+
+                scene.Remove(target);
+                target.Destroy(); // TODO: Should this be Dispose... or Destroy? Destroy defers it to end of frame?
+                EditorSceneManager.MarkDirty();
+            });
+    }
+
+    // ================================================================
+    //  Continuous Operations (Gizmo Drag)
+    // ================================================================
+
+    /// <summary>
+    /// Begin a continuous undo operation (e.g., gizmo drag).
+    /// Snapshots all targets' transforms at the start. Call EndContinuous when done.
+    /// </summary>
+    public static void BeginContinuous(GameObject[] targets, string description)
+    {
+        if (Application.IsPlaying) return;
+        if (_isContinuous) return;
+
+        _isContinuous = true;
+        _continuousDescription = description;
+        _continuousStartState = [];
+
+        foreach (GameObject go in targets)
+        {
+            if (go == null) continue;
+            _continuousStartState.Add((go.Identifier, go.Transform.LocalPosition, go.Transform.LocalRotation, go.Transform.LocalScale));
+        }
+    }
+
+    /// <summary>
+    /// End a continuous operation and push one undo step if anything changed.
+    /// </summary>
+    public static void EndContinuous()
+    {
+        if (!_isContinuous || _continuousStartState == null) return;
+
+        var records = new List<UndoRecord>();
+
+        foreach ((Guid goId, Float3 startPos, Quaternion startRot, Float3 startScale) in _continuousStartState)
+        {
+            GameObject? go = FindGO(goId);
+            if (go == null) continue;
+
+            Float3 endPos = go.Transform.LocalPosition;
+            Quaternion endRot = go.Transform.LocalRotation;
+            Float3 endScale = go.Transform.LocalScale;
+
+            if (startPos.Equals(endPos) && startRot == endRot && startScale.Equals(endScale))
+                continue;
+
+            Guid capturedId = goId;
+            Float3 sPos = startPos; Quaternion sRot = startRot; Float3 sScale = startScale;
+            Float3 ePos = endPos; Quaternion eRot = endRot; Float3 eScale = endScale;
+
+            records.Add(new ActionRecord(
+                undo: () =>
+                {
+                    GameObject? g = FindGO(capturedId);
+                    if (g == null) return;
+                    g.Transform.LocalPosition = sPos;
+                    g.Transform.LocalRotation = sRot;
+                    g.Transform.LocalScale = sScale;
+                },
+                redo: () =>
+                {
+                    GameObject? g = FindGO(capturedId);
+                    if (g == null) return;
+                    g.Transform.LocalPosition = ePos;
+                    g.Transform.LocalRotation = eRot;
+                    g.Transform.LocalScale = eScale;
+                }));
+        }
+
+        if (records.Count > 0)
+        {
+            PushStep(new UndoStep(_continuousDescription, records));
+        }
+
+        _isContinuous = false;
+        _continuousStartState = null;
+    }
+
+    /// <summary>
+    /// Cancel a continuous operation without pushing an undo step.
+    /// Restores all targets to their start state.
+    /// </summary>
+    public static void CancelContinuous()
+    {
+        if (!_isContinuous || _continuousStartState == null) return;
+
+        foreach ((Guid goId, Float3 startPos, Quaternion startRot, Float3 startScale) in _continuousStartState)
+        {
+            GameObject? go = FindGO(goId);
+            if (go == null) continue;
+            go.Transform.LocalPosition = startPos;
+            go.Transform.LocalRotation = startRot;
+            go.Transform.LocalScale = startScale;
+        }
+
+        _isContinuous = false;
+        _continuousStartState = null;
+    }
+
+    // ================================================================
+    //  Grouping
+    // ================================================================
+
+    /// <summary>
+    /// Force a new group boundary. Flushes any pending records into a step,
+    /// so the next RecordObject starts a fresh step.
+    /// </summary>
+    public static void IncrementGroup()
+    {
+        FlushPendingRecords();
+    }
+
+    // ================================================================
+    //  Execute Undo/Redo
+    // ================================================================
+
+    /// <summary> Perform one undo step. If a continuous operation is active, cancels it instead. Flushes pending records before undoing. </summary>
+    public static void PerformUndo()
+    {
+        if (Application.IsPlaying) return;
+
+        // If continuous mode is active, cancel it instead of undoing
+        if (_isContinuous)
+        {
+            CancelContinuous();
+            return;
+        }
+
+        // Flush any pending records first
+        FlushPendingRecords();
+
+        if (_undoStack.Count == 0) return;
+
+        UndoStep step = _undoStack[^1];
+        _undoStack.RemoveAt(_undoStack.Count - 1);
+
+        // Undo in reverse order
+        for (int i = step.Records.Count - 1; i >= 0; i--)
+        {
+            try
+            {
+                step.Records[i].PerformUndo();
+            }
+            catch (Exception ex)
+            {
+                Runtime.Debug.LogWarning($"Undo failed for record {i}: {ex.Message}");
+            }
+        }
+
+        _redoStack.Add(step);
+        TrimStack(_redoStack);
+
+        EditorSceneManager.MarkDirty();
+        OnUndoRedo?.Invoke();
+    }
+
+    /// <summary> Perform one redo step. Does nothing if a continuous operation is active. Flushes pending records before redoing. </summary>
+    public static void PerformRedo()
+    {
+        if (Application.IsPlaying) return;
+        if (_isContinuous) return;
+
+        // Flush any pending records first
+        FlushPendingRecords();
+
+        if (_redoStack.Count == 0) return;
+
+        UndoStep step = _redoStack[^1];
+        _redoStack.RemoveAt(_redoStack.Count - 1);
+
+        // Redo in forward order
+        for (int i = 0; i < step.Records.Count; i++)
+        {
+            try
+            {
+                step.Records[i].PerformRedo();
+            }
+            catch (Exception ex)
+            {
+                Runtime.Debug.LogWarning($"Redo failed for record {i}: {ex.Message}");
+            }
+        }
+
+        _undoStack.Add(step);
+        TrimStack(_undoStack);
+
+        EditorSceneManager.MarkDirty();
+        OnUndoRedo?.Invoke();
+    }
+
+    // ================================================================
+    //  Lifecycle
+    // ================================================================
+
+    /// <summary>
+    /// Called once per frame by EditorApplication after all UI has been drawn.
+    /// Flushes pending property snapshots into undo steps.
+    /// </summary>
+    internal static void FlushFrame()
+    {
+        FlushPendingRecords();
+    }
+
+    /// <summary>
+    /// Set the history aside and start an empty one, for a session that edits something other than
+    /// the open scene. Returns what was put away, to be handed back to <see cref="PopContext"/>.
+    /// <para/>
+    /// Opening a prefab used to clear the history outright, so glancing at one cost the user every
+    /// step they had taken in the scene. The two sets of steps cannot simply be shared either: a step
+    /// recorded against the prefab addresses objects that stop existing when the session ends.
+    /// </summary>
+    internal static object PushContext()
+    {
+        var saved = new UndoContext(
+            [.. _undoStack], [.. _redoStack],
+            new Dictionary<object, MemoryCopy>(_pendingSnapshots),
+            [.. _pendingActions], [.. _pendingActionGroups], [.. _pendingStructural],
+            _isContinuous, _continuousDescription, _continuousStartState);
+
+        Clear();
+        return saved;
+    }
+
+    /// <summary>Put back a history <see cref="PushContext"/> set aside, discarding the current one.</summary>
+    internal static void PopContext(object? context)
+    {
+        Clear();
+        if (context is not UndoContext saved) return;
+
+        _undoStack.AddRange(saved.UndoSteps);
+        _redoStack.AddRange(saved.RedoSteps);
+        foreach ((object? target, MemoryCopy? before) in saved.Snapshots) _pendingSnapshots[target] = before;
+        _pendingActions.AddRange(saved.Actions);
+        _pendingActionGroups.AddRange(saved.ActionGroups);
+        _pendingStructural.AddRange(saved.Structural);
+        _isContinuous = saved.IsContinuous;
+        _continuousDescription = saved.ContinuousDescription;
+        _continuousStartState = saved.ContinuousStartState;
+    }
+
+    private sealed record UndoContext(
+        List<UndoStep> UndoSteps,
+        List<UndoStep> RedoSteps,
+        Dictionary<object, MemoryCopy> Snapshots,
+        List<(string description, UndoRecord record)> Actions,
+        List<(UndoStep step, bool coalesce)> ActionGroups,
+        List<(GameObject go, string description, bool isCreate)> Structural,
+        bool IsContinuous,
+        string ContinuousDescription,
+        List<(Guid goId, Float3 pos, Quaternion rot, Float3 scale)>? ContinuousStartState);
+
+    /// <summary>
+    /// Clear all undo/redo history. Called on scene load.
+    /// </summary>
+    public static void Clear()
+    {
+        _undoStack.Clear();
+        _redoStack.Clear();
+        ClearPending();
+    }
+
+    /// <summary>Drops edits that were captured but not yet recorded, keeping the undo and redo history.</summary>
+    public static void ClearPending()
+    {
+        _pendingSnapshots.Clear();
+        _pendingActions.Clear();
+        _pendingActionGroups.Clear();
+        _pendingStructural.Clear();
+        _isContinuous = false;
+        _continuousStartState = null;
+    }
+
+    // ================================================================
+    //  Internal Helpers
+    // ================================================================
+
+    private static void FlushPendingRecords()
+    {
+        // Flush deferred structural operations first (serializes created GOs now that components are added)
+        foreach ((GameObject? go, string? desc, bool isCreate) in _pendingStructural)
+        {
+            if (go == null || go.IsDisposed) continue;
+            if (isCreate)
+                FlushCreatedObject(go, desc);
+        }
+        _pendingStructural.Clear();
+
+        // Flush action records FIRST as separate steps (never merge with property changes)
+        // Each action is its own undo step (Add Component, Toggle Enabled, Reparent, etc.)
+        bool hasActions = _pendingActions.Count > 0 || _pendingActionGroups.Count > 0;
+
+        // Grouped actions push as a single multi-record step (coalescing continuous edits).
+        foreach ((UndoStep? step, bool coalesce) in _pendingActionGroups)
+        {
+            if (coalesce && TryCoalesceActionGroup(step)) { _redoStack.Clear(); continue; }
+            PushStep(step);
+        }
+        _pendingActionGroups.Clear();
+
+        foreach ((string? desc, UndoRecord? record) in _pendingActions)
+            PushStep(new UndoStep(desc, [record], isCoalescable: false));
+        _pendingActions.Clear();
+
+        // If explicit actions were registered this frame, discard property snapshots.
+        // The actions already handle their changes the Snapshot diff would create duplicates
+        // (e.g., Component Enabled toggle: RegisterAction changes _enabled, Snapshot also detects it).
+        if (hasActions)
+        {
+            _pendingSnapshots.Clear();
+            return;
+        }
+
+        // Build property records from snapshots
+        var propertyRecords = new List<PropertyRecord>();
+
+        foreach ((object? target, MemoryCopy? before) in _pendingSnapshots)
+        {
+            if (target is EngineObject eo && eo.IsDisposed) continue;
+
+            MemoryCopy after = Capture(target);
+
+            if (!before.Data.Equals(after.Data))
+                propertyRecords.Add(new PropertyRecord(target, before, after));
+        }
+        _pendingSnapshots.Clear();
+
+        // Push property records as a coalescable step (separate from actions)
+        if (propertyRecords.Count > 0 && TryCoalesce(propertyRecords))
+        {
+            _redoStack.Clear();
+        }
+        else if (propertyRecords.Count > 0)
+        {
+            PushStep(new UndoStep("Modify Properties", [.. propertyRecords.Cast<UndoRecord>()], isCoalescable: true));
+        }
+    }
+
+    /// <summary>
+    /// Try to merge new property records into the previous undo step.
+    /// Uses time-based coalescing: merges if same targets, continuous edit chain,
+    /// and the previous step was created/updated within 300ms.
+    /// </summary>
+    private const long CoalesceWindowMs = 300;
+
+    private static bool TryCoalesce(List<PropertyRecord> newRecords)
+    {
+        if (_undoStack.Count == 0) return false;
+
+        UndoStep prev = _undoStack[^1];
+        if (!prev.IsCoalescable) return false;
+        if (prev.Records.Count != newRecords.Count) return false;
+
+        // Time-based: only coalesce within the time window
+        long now = Environment.TickCount64;
+        if (now - prev.Timestamp > CoalesceWindowMs) return false;
+
+        for (int i = 0; i < newRecords.Count; i++)
+        {
+            if (prev.Records[i] is not PropertyRecord prevPR) return false;
+            PropertyRecord newPR = newRecords[i];
+
+            // Same target? Compare by identifier for Component, by fallback ref for others
+            if (prevPR.ComponentIdentifier != Guid.Empty || newPR.ComponentIdentifier != Guid.Empty)
+            {
+                if (prevPR.ComponentIdentifier != newPR.ComponentIdentifier) return false;
+            }
+            else
+            {
+                object? prevTarget = prevPR.ResolveTarget();
+                object? newTarget = newPR.ResolveTarget();
+                if (prevTarget == null || newTarget == null || !ReferenceEquals(prevTarget, newTarget)) return false;
+            }
+
+            // Continuous edit chain: previous "after" must match new "before"
+            if (!prevPR.AfterState.Data.Equals(newPR.BeforeState.Data)) return false;
+        }
+
+        // Coalesce: update AfterState and refresh timestamp
+        for (int i = 0; i < newRecords.Count; i++)
+            ((PropertyRecord)prev.Records[i]).AfterState = newRecords[i].AfterState;
+        prev.Timestamp = now;
+        return true;
+    }
+
+    /// <summary>Merge a grouped action step into the previous step when it matches (continuous edits).</summary>
+    private static bool TryCoalesceActionGroup(UndoStep step)
+    {
+        if (_undoStack.Count == 0) return false;
+
+        UndoStep prev = _undoStack[^1];
+        if (prev.Description != step.Description) return false;
+        if (prev.Records.Count != step.Records.Count) return false;
+        if (Environment.TickCount64 - prev.Timestamp > CoalesceWindowMs) return false;
+
+        for (int i = 0; i < prev.Records.Count; i++)
+            if (prev.Records[i] is not ActionRecord || step.Records[i] is not ActionRecord) return false;
+
+        // Keep each original undo, adopt the latest redo.
+        for (int i = 0; i < prev.Records.Count; i++)
+            prev.Records[i] = new ActionRecord(((ActionRecord)prev.Records[i]).UndoAction, ((ActionRecord)step.Records[i]).RedoAction);
+        prev.Timestamp = Environment.TickCount64;
+        return true;
+    }
+
+    private static void PushStep(UndoStep step)
+    {
+        _undoStack.Add(step);
+        _redoStack.Clear(); // New action invalidates redo stack
+        TrimStack(_undoStack);
+    }
+
+    private static void TrimStack(List<UndoStep> stack)
+    {
+        while (stack.Count > MaxSteps)
+            stack.RemoveAt(0);
+    }
+
+    // Never leaves memory, so runtime assets are linked rather than copied, and held as long as the copy.
+    private static MemoryCopy Capture(object target)
+    {
+        var context = new DependencySerializationContext { LinkRuntimeAssets = true };
+        return new MemoryCopy(Serializer.Serialize(target.GetType(), target, context), context.LinkedAssets);
+    }
+
+    // Fields that must never be overwritten by undo they are identity/internal state
+    private static readonly HashSet<string> _undoSkipFields =
+    [
+        "_identifier",        // Component identity must be preserved
+        "_instanceID",        // EngineObject instance ID
+        "_enabledInHierarchy",// Derived state, not user-settable
+        "_go",                // GameObject back-reference (not serialized, but just in case)
+        "_hasStarted",        // Lifecycle flags
+        "_hasBeenEnabled",
+        "_executeAlwaysCached",
+        "<IsDisposed>k__BackingField", // Disposed state
+    ];
+
+    /// <summary>
+    /// Copy serializable fields from an EchoObject onto a live object.
+    /// Deserializes into a temp then copies fields, preserving the live reference.
+    /// Skips identity and internal state fields.
+    /// </summary>
+    private static void CopyFieldsFromEcho(object target, Type type, EchoObject echo)
+    {
+        try
+        {
+            object? temp = Serializer.Deserialize(echo, type);
+            if (temp == null) return;
+
+            // Walk up the hierarchy to get all serializable fields (matching Echo's behavior)
+            Type? currentType = type;
+            while (currentType != null && currentType != typeof(object))
+            {
+                foreach (FieldInfo field in currentType.GetFields(
+                    BindingFlags.Public |
+                    BindingFlags.NonPublic |
+                    BindingFlags.Instance |
+                    BindingFlags.DeclaredOnly))
+                {
+                    // Skip identity/internal fields
+                    if (_undoSkipFields.Contains(field.Name)) continue;
+
+                    bool shouldSerialize = field.IsPublic || field.GetCustomAttribute<Echo.SerializeFieldAttribute>() != null;
+                    bool shouldIgnore = field.GetCustomAttribute<Echo.SerializeIgnoreAttribute>() != null
+                                     || field.GetCustomAttribute<NonSerializedAttribute>() != null;
+                    if (!shouldSerialize || shouldIgnore) continue;
+
+                    try
+                    {
+                        object? value = field.GetValue(temp);
+                        field.SetValue(target, value);
+                    }
+                    catch
+                    {
+                        // Skip fields that fail
+                    }
+                }
+                currentType = currentType.BaseType;
+            }
+        }
+        catch (Exception ex)
+        {
+            Runtime.Debug.LogWarning($"Failed to restore object state: {ex.Message}");
+        }
+    }
+
+    // ================================================================
+    //  Identifier-Based Resolution (for undo lambdas)
+    // ================================================================
+
+    /// <summary>
+    /// Find a GameObject by identifier in the current scene. Returns null if not found.
+    /// Use this in undo/redo lambdas instead of capturing GO references directly.
+    /// </summary>
+    public static GameObject? FindGO(Guid identifier)
+    {
+        Scene scene = Scene.Current;
+        if (scene == null) return null;
+        foreach (GameObject root in scene.RootObjects)
+        {
+            GameObject found = root.FindChildByIdentifier(identifier);
+            if (found != null) return found;
+        }
+        return null;
+    }
+
+    /// <summary>
+    /// Find a component by identifier across all GOs in the current scene.
+    /// </summary>
+    public static Component? FindComponent(Guid identifier)
+    {
+        Scene scene = Scene.Current;
+        if (scene == null) return null;
+        foreach (GameObject go in scene.AllObjects)
+        {
+            Component? comp = go.GetComponentByIdentifier(identifier);
+            if (comp != null) return comp;
+        }
+        return null;
+    }
+
+    // Private alias used by PropertyRecord
+    private static Component? FindComponentByIdentifier(Guid identifier) => FindComponent(identifier);
+
+    private static GameObject? FindGameObjectByIdentifier(Scene scene, Guid identifier)
+    {
+        if (scene == null) return null;
+        foreach (GameObject root in scene.RootObjects)
+        {
+            GameObject found = root.FindChildByIdentifier(identifier);
+            if (found != null) return found;
+        }
+        return null;
+    }
+}

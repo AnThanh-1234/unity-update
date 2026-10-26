@@ -1,0 +1,103 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+
+using Prowl.Echo;
+
+namespace Prowl.Runtime.MeshFeatures;
+
+/// <summary>
+/// Discovers all <see cref="MeshFeatureSpec"/> subclasses via reflection. The
+/// aggregate version across specs is part of every mesh-producing importer's
+/// <c>Version</c>, so bumping any feature's version forces a global reimport.
+/// </summary>
+public static class MeshFeatureRegistry
+{
+    private static readonly Dictionary<string, MeshFeatureSpec> _specs = new(StringComparer.Ordinal);
+    private static bool _initialized;
+
+    /// <summary>All registered feature specs, in insertion order.</summary>
+    public static IReadOnlyCollection<MeshFeatureSpec> Specs
+    {
+        get { Initialize(); return _specs.Values; }
+    }
+
+    /// <summary>Sum of every spec's <see cref="MeshFeatureSpec.Version"/>, read live since a version can follow settings. Feeds importer versions.</summary>
+    public static int AggregateVersion
+    {
+        get
+        {
+            Initialize();
+            int sum = 0;
+            foreach (MeshFeatureSpec spec in _specs.Values) sum = unchecked(sum + spec.Version);
+            return sum;
+        }
+    }
+
+    public static MeshFeatureSpec? Find(string key)
+    {
+        Initialize();
+        return _specs.TryGetValue(key, out MeshFeatureSpec? s) ? s : null;
+    }
+
+    public static void Reinitialize()
+    {
+        _initialized = false;
+        _specs.Clear();
+        Initialize();
+    }
+
+    /// <summary>
+    /// Drop cached specs without re-scanning, so a collectible AssemblyLoadContext holding
+    /// user <see cref="MeshFeatureSpec"/> types can be unloaded. Specs rebuild on the next
+    /// <see cref="Initialize"/>/<see cref="Reinitialize"/> after the new assemblies are loaded.
+    /// </summary>
+    public static void ClearCache()
+    {
+        _initialized = false;
+        _specs.Clear();
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Engine bootstrap: scans loaded assemblies for MeshFeatureSpec subclasses. Spec types must be preserved by the consuming application's trim configuration.")]
+    [UnconditionalSuppressMessage("Trimming", "IL2072:DynamicallyAccessedMembers",
+        Justification = "MeshFeatureSpec subclasses are required to expose a parameterless constructor by contract; the trimmer preserves them via the same trim configuration as above.")]
+    public static void Initialize()
+    {
+        if (_initialized) return;
+        _initialized = true;
+
+        foreach (Type type in RuntimeUtils.FindTypesImplementing(typeof(MeshFeatureSpec)))
+        {
+            try
+            {
+                var spec = (MeshFeatureSpec)Activator.CreateInstance(type)!;
+                if (_specs.ContainsKey(spec.Key))
+                {
+                    Debug.LogWarning($"Duplicate mesh feature key '{spec.Key}'; ignoring {type.FullName}.");
+                    continue;
+                }
+                _specs.Add(spec.Key, spec);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Failed to register MeshFeatureSpec {type.FullName}: {ex.Message}");
+            }
+        }
+
+        Debug.Log($"MeshFeatureRegistry: {_specs.Count} feature(s) registered.");
+    }
+
+    /// <summary>
+    /// Call every spec's <see cref="MeshFeatureSpec.PopulateDefaults"/> into the given compound.
+    /// Used by importers that emit meshes when building their default settings blob.
+    /// </summary>
+    public static void PopulateDefaultSettings(EchoObject settings)
+    {
+        foreach (MeshFeatureSpec spec in Specs)
+            spec.PopulateDefaults(settings);
+    }
+}

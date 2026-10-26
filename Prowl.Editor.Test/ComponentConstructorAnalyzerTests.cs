@@ -1,0 +1,167 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Prowl.Analyzers;
+using Prowl.Editor.Projects.Scripting;
+
+using Xunit;
+
+namespace Prowl.Editor.Test;
+
+/// <summary>
+/// Verifies the analyzer that steers users away from constructors on components, and refuses one
+/// the engine could never construct at all.
+/// </summary>
+[Trait("Category", "Build")]
+public class ComponentConstructorAnalyzerTests : EditorTestHarness
+{
+    [Fact]
+    public void WarnsOnAParameterlessConstructor()
+    {
+        WriteScript("Ctor.cs", "public class Ctor : Prowl.Runtime.Component { public Ctor() { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors); // a warning, so the compile still succeeds
+        Assert.Contains(ComponentConstructorAnalyzer.DeclaredConstructorId, result.Output);
+    }
+
+    /// <summary>
+    /// The shape behind the crash this came from: nothing can create it, so it could be dragged
+    /// onto the inspector and silently do nothing.
+    /// </summary>
+    [Fact]
+    public void ErrorsWhenNothingCanConstructIt()
+    {
+        WriteScript("NeedsArgs.cs", "public class NeedsArgs : Prowl.Runtime.Component { public NeedsArgs(int x) { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.Contains(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+
+    [Fact]
+    public void APrivateParameterlessConstructorStillCannotBeConstructed()
+    {
+        WriteScript("Hidden.cs", "public class Hidden : Prowl.Runtime.Component { private Hidden() { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.Contains(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+
+    /// <summary>An overload the engine can reach is enough, even though the pair is still discouraged.</summary>
+    [Fact]
+    public void APublicParameterlessOverloadIsConstructableButStillWarns()
+    {
+        WriteScript("Both.cs",
+            "public class Both : Prowl.Runtime.Component { public Both() { } public Both(int x) { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.Contains(ComponentConstructorAnalyzer.DeclaredConstructorId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+
+    /// <summary>An abstract component is never constructed directly, so only the warning applies.</summary>
+    [Fact]
+    public void AnAbstractComponentIsNotAskedToBeConstructable()
+    {
+        WriteScript("Base.cs",
+            "public abstract class BaseThing : Prowl.Runtime.Component { protected BaseThing(int x) { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.Contains(ComponentConstructorAnalyzer.DeclaredConstructorId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+
+    /// <summary>
+    /// The shape that took a real project down: no declared constructor at all, but a field
+    /// initializer the compiler moves into one, calling a static delegate nothing has assigned yet.
+    /// </summary>
+    [Fact]
+    public void WarnsOnAFieldInitializerThatCallsSomething()
+    {
+        WriteScript("Reg.cs", "public static class Reg { public static System.Func<int> Get; }");
+        WriteScript("Init.cs", "public class Init : Prowl.Runtime.Component { private int _v = Reg.Get(); }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        // A null delegate cannot be defended, so this refuses to compile rather than warning.
+        Assert.False(result.Success);
+        Assert.Contains(ComponentConstructorAnalyzer.InvokesDelegateId, result.Output);
+    }
+
+    /// <summary>
+    /// Calling the project's own code is suspect but may be pure, so it warns rather than refusing.
+    /// The engine relies on exactly this for a component's default sprite.
+    /// </summary>
+    [Fact]
+    public void WarnsButCompilesWhenAnInitializerCallsOwnCode()
+    {
+        WriteScript("Pure.cs", "public static class Pure { public static int Twice(int x) => x * 2; }");
+        WriteScript("Uses.cs", "public class Uses : Prowl.Runtime.Component { private int _v = Pure.Twice(2); }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.Contains(ComponentConstructorAnalyzer.RunsBeforeAttachId, result.Output);
+    }
+
+    /// <summary>A framework helper does not care how far through loading a scene is.</summary>
+    [Fact]
+    public void SaysNothingAboutAFrameworkCall()
+    {
+        WriteScript("Fw.cs",
+            "public class Fw : Prowl.Runtime.Component { private string _id = System.Guid.NewGuid().ToString(); }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.RunsBeforeAttachId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.InvokesDelegateId, result.Output);
+    }
+
+    /// <summary>A constant or a plain object is not reaching for anything, so it stays quiet.</summary>
+    [Fact]
+    public void SaysNothingAboutAPlainFieldInitializer()
+    {
+        WriteScript("Defaults.cs",
+            "public class Defaults : Prowl.Runtime.Component " +
+            "{ public int Speed = 5; public string Name = \"hi\"; " +
+            "public System.Collections.Generic.List<int> Items = new(); }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.RunsBeforeAttachId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.InvokesDelegateId, result.Output);
+    }
+
+    [Fact]
+    public void SaysNothingAboutAComponentWithNoConstructor()
+    {
+        WriteScript("Plain.cs", "public class Plain : Prowl.Runtime.Component { public int Speed = 5; }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.DeclaredConstructorId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+
+    /// <summary>A plain class is nothing to do with the engine's construction, so it is left alone.</summary>
+    [Fact]
+    public void SaysNothingAboutANonComponent()
+    {
+        WriteScript("Helper.cs", "public class Helper { public Helper(int x) { } }");
+
+        ScriptCompiler.CompileResult result = ScriptCompiler.CompileAll(Project);
+
+        Assert.True(result.Success, result.Errors);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.DeclaredConstructorId, result.Output);
+        Assert.DoesNotContain(ComponentConstructorAnalyzer.NoParameterlessConstructorId, result.Output);
+    }
+}

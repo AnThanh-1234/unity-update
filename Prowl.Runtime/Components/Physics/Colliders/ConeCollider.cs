@@ -1,0 +1,46 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Jitter2.Collision.Shapes;
+
+using Prowl.Echo;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+[AddComponentMenu("Physics/Colliders/Cone Collider")]
+[ComponentIcon("\ue4dc")] // Burst
+public sealed class ConeCollider : Collider
+{
+    [SerializeField] private float radius = 0.5f;
+    [SerializeField] private float height = 2;
+
+    public float Radius
+    {
+        get => radius;
+        set
+        {
+            radius = value;
+            Rebuild();
+        }
+    }
+
+    public float Height
+    {
+        get => height;
+        set
+        {
+            height = value;
+            Rebuild();
+        }
+    }
+
+    public override RigidBodyShape[] CreateShapes() => [new ConeShape(Maths.Max(radius, 0.01f), Maths.Max(height, 0.01f))];
+
+    public override void DrawGizmosSelected()
+    {
+        Debug.PushMatrix(GizmoMatrix);
+        Debug.DrawWireCone(new Float3(0, -height * 0.25f, 0), new Float3(0, height, 0), radius, Color.Green);
+        Debug.PopMatrix();
+    }
+}

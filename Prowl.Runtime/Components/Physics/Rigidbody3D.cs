@@ -1,0 +1,1119 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Linq;
+
+using Jitter2;
+using Jitter2.Collision.Shapes;
+using Jitter2.DataStructures;
+using Jitter2.Dynamics;
+using Jitter2.Dynamics.Constraints;
+using Jitter2.LinearMath;
+
+using Prowl.Echo;
+using Prowl.Runtime.Resources;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+/// <summary>
+/// How a rigidbody's Transform is filled in between physics steps. Physics runs at a fixed rate, so
+/// without smoothing the visuals move in fixed-rate jumps whenever the frame rate differs from it.
+/// </summary>
+public enum RigidbodyInterpolation
+{
+    /// <summary>Write the simulated pose as-is. Cheapest, and visibly steps at high frame rates.</summary>
+    None,
+    /// <summary>Render between the last two steps. Smooth, at the cost of trailing one fixed step behind.</summary>
+    Interpolate,
+    /// <summary>Predict ahead of the last step from the body's velocity. No lag, but can overshoot a collision.</summary>
+    Extrapolate
+}
+
+[AddComponentMenu("Physics/Rigidbody")]
+[ComponentIcon("\uf1b2")] // Cube
+public sealed class Rigidbody3D : Component, ITransformChangeListener
+{
+    public class RigidBodyUserData
+    {
+        public Rigidbody3D Rigidbody { get; set; }
+        public int InstanceID { get; set; }
+        public int Layer { get; set; }
+    }
+
+    [SerializeField] private MotionType motionType = MotionType.Dynamic;
+    [SerializeField, InspectorName("Continuous Collision Detection")] private bool isSpeculative;
+    [SerializeField] private bool useGravity = true;
+    [SerializeField] private bool enableGyroscopicForces = false;
+    [SerializeField] private float mass = 1;
+    [SerializeField] private bool overrideInertia;
+    [SerializeField] private Float3 inertiaOverride = Float3.One;
+    [SerializeField] private bool overrideCenterOfMass;
+    [SerializeField] private Float3 centerOfMassOverride;
+    [SerializeField, Range(0, 1)] private float linearDamping = 0.0f;
+    [SerializeField, Range(0, 1)] private float angularDamping = 0.0f;
+    [SerializeField] private float friction = 0.2f;
+    [SerializeField, Range(0, 1)] private float restitution = 0;
+    [SerializeField] private float deactivationTime = 1.0f;
+    [SerializeField] private float linearSleepThreshold = 0.1f;
+    [SerializeField] private float angularSleepThreshold = 0.1f;
+
+    [SerializeField] private RigidbodyInterpolation interpolation = RigidbodyInterpolation.Interpolate;
+    [SerializeField] private RigidbodyConstraints constraints = RigidbodyConstraints.None;
+
+    /// <summary>
+    /// World-space axes this body may not move or turn along during simulation. The body can still
+    /// be placed on a frozen axis with <see cref="MovePosition"/> or <see cref="MoveRotation"/>.
+    /// </summary>
+    public RigidbodyConstraints Constraints
+    {
+        get => constraints;
+        set
+        {
+            AssertOwner();
+            constraints = value;
+            if (IsSimulated) _body.AllowedMotion = MotionAxes.All & ~(MotionAxes)value;
+        }
+    }
+
+    // The poses the last two steps produced. How far into the current step the frame being drawn
+    // sits is Time.FixedAccumulator, which the game loop already tracks for every body at once.
+    private Float3 _previousPosition, _currentPosition;
+    private Quaternion _previousRotation, _currentRotation;
+    private bool _hasPose;
+
+    // Bookkeeping owned by PhysicsWorld: this body's slot in its sync list, and the step that last captured it.
+    internal int SyncIndex = -1;
+    internal uint CaptureStamp;
+    internal bool SyncQueued;
+    internal PhysicsWorld SyncWorld;
+
+    // Set while the physics write back moves the Transform, so that move is not mistaken for an edit.
+    private bool _writingPose;
+
+    // Transform.Version last pushed into the physics body, so SyncTransformToBody only pushes when
+    // the user actually edited the Transform (not when the physics readback wrote it).
+    private uint _lastSyncedTransformVersion;
+
+    /// <summary>
+    /// How the Transform is filled in between fixed steps. Turn this on for anything the player
+    /// watches closely; leave it off for bodies whose exact pose per frame does not matter.
+    /// </summary>
+    public RigidbodyInterpolation Interpolation
+    {
+        get => interpolation;
+        set
+        {
+            AssertOwner();
+            interpolation = value;
+            ResetPose();
+        }
+    }
+
+    /// <summary>
+    /// How this body participates in the simulation: <see cref="MotionType.Dynamic"/>,
+    /// <see cref="MotionType.Kinematic"/>, or <see cref="MotionType.Static"/>.
+    /// </summary>
+    public MotionType MotionType
+    {
+        get => motionType;
+        set
+        {
+            AssertOwner();
+            motionType = value;
+            if (IsSimulated) _body.MotionType = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether continuous collision detection is enabled for this body.
+    /// </summary>
+    public bool EnableSpeculativeContacts
+    {
+        get => isSpeculative;
+        set
+        {
+            AssertOwner();
+            isSpeculative = value;
+            if (IsSimulated) _body.EnableCcd = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets a value indicating whether this Rigidbody3D is affected by gravity.
+    /// </summary>
+    public bool AffectedByGravity
+    {
+        get => useGravity;
+        set
+        {
+            AssertOwner();
+            useGravity = value;
+            if (IsSimulated) _body.AffectedByGravity = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the mass of this Rigidbody3D.
+    /// </summary>
+    public float Mass
+    {
+        get => mass;
+        set
+        {
+            AssertOwner();
+            if (value <= 0.0)
+                throw new ArgumentException("Mass can not be zero or negative.", nameof(value));
+
+            mass = value;
+            ApplyMassInertia();
+        }
+    }
+
+    /// <summary>
+    /// Replaces the inertia worked out from the colliders with this diagonal, in the body's own space, in kg m^2, or null
+    /// to work it out from the colliders. Heavier than the shapes give, a body turns more steadily, which a jointed chain
+    /// of a light body and a heavy one needs.
+    /// </summary>
+    public Float3? InertiaTensorOverride
+    {
+        get => overrideInertia ? inertiaOverride : null;
+        set
+        {
+            AssertOwner();
+            overrideInertia = value.HasValue;
+            if (value.HasValue) inertiaOverride = Maths.Max(value.Value, new Float3(1e-6f));
+            ApplyMassInertia();
+        }
+    }
+
+    /// <summary>
+    /// Where the body's mass is centred, in metres along its own axes from its origin, or null for the origin itself.
+    /// The body turns about this point and gravity pulls through it, while its colliders, its Transform and
+    /// <see cref="Position"/> stay where they are. Changing it on a moving body keeps the body's motion, and rebuilds
+    /// the joints on it.
+    /// </summary>
+    public Float3? CenterOfMassOverride
+    {
+        get => overrideCenterOfMass ? centerOfMassOverride : null;
+        set
+        {
+            AssertOwner();
+            overrideCenterOfMass = value.HasValue;
+            if (value.HasValue) centerOfMassOverride = value.Value;
+            ApplyCenterOfMass();
+        }
+    }
+
+    /// <summary>The centre of mass the simulated body and its shapes are currently built around, in the body's space.</summary>
+    internal Float3 AppliedCenterOfMass => _appliedCenterOfMass;
+    private Float3 _appliedCenterOfMass;
+
+    private Float3 LocalCenterOfMass => overrideCenterOfMass ? centerOfMassOverride : Float3.Zero;
+
+    /// <summary>Rebuilds the body around a new centre of mass, keeping its origin, its pose and how every point on it moves.</summary>
+    private void ApplyCenterOfMass()
+    {
+        Float3 next = LocalCenterOfMass;
+        if (!IsSimulated)
+        {
+            _appliedCenterOfMass = next;
+            return;
+        }
+        if (next.Equals(_appliedCenterOfMass)) return;
+
+        Float3 origin = Position;
+        Quaternion rotation = Rotation;
+        Float3 center = origin + rotation * next;
+        Float3 velocity = GetPointVelocity(center);
+
+        Float3 shift = next - _appliedCenterOfMass;
+        _appliedCenterOfMass = next;
+        UpdateShapes(_body);
+        _body.Position = center.ToJitter();
+        if (motionType != MotionType.Static) _body.Velocity = velocity.ToJitter();
+        ShiftJointAnchors(shift);
+    }
+
+    /// <summary>
+    /// Keeps every joint on the body holding the same points on it after its centre of mass moved by
+    /// <paramref name="shift"/> in its own space. Joints keep their anchors from the centre of mass, so each anchor on
+    /// this body moves back by the shift. Nothing is rebuilt, so limits, drift and warm starts carry on as they were.
+    /// </summary>
+    private void ShiftJointAnchors(Float3 shift)
+    {
+        JVector by = shift.ToJitter();
+        foreach (Constraint constraint in _body!.Constraints)
+        {
+            bool first = constraint.Body1 == _body, second = constraint.Body2 == _body;
+            switch (constraint)
+            {
+                case BallSocket c:
+                    if (first) c.Data.LocalAnchor1 -= by;
+                    if (second) c.Data.LocalAnchor2 -= by;
+                    break;
+                case DistanceLimit c:
+                    if (first) c.Data.LocalAnchor1 -= by;
+                    if (second) c.Data.LocalAnchor2 -= by;
+                    break;
+                case PointOnLine c:
+                    if (first) c.Data.LocalAnchor1 -= by;
+                    if (second) c.Data.LocalAnchor2 -= by;
+                    break;
+                case PointOnPlane c:
+                    if (first) c.Data.LocalAnchor1 -= by;
+                    if (second) c.Data.LocalAnchor2 -= by;
+                    break;
+            }
+        }
+
+        if (GameObject.Scene.IsValid()) GameObject.Scene.Physics?.RefreshConstraints(this);
+    }
+
+    /// <summary>Where the simulated body's centre goes for an origin pose.</summary>
+    private JVector BodyPosition(Float3 origin, Quaternion rotation) => (origin + rotation * _appliedCenterOfMass).ToJitter();
+
+    /// <summary>The origin of a simulated body pose.</summary>
+    private Float3 OriginOf(JVector position, JQuaternion orientation)
+        => position.ToProwl() - orientation.ToProwl() * _appliedCenterOfMass;
+
+    /// <summary>
+    /// Gets or sets the friction of this Rigidbody3D.
+    /// </summary>
+    public float Friction
+    {
+        get => friction;
+        set
+        {
+            AssertOwner();
+            if (value < 0.0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Friction can not be negative.");
+
+            friction = value;
+            if (IsSimulated) _body.Friction = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the restitution of this Rigidbody3D.
+    /// </summary>
+    public float Restitution
+    {
+        get => restitution;
+        set
+        {
+            AssertOwner();
+            if (value < 0.0 || value > 1.0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Restitution must be between 0 and 1.");
+
+            restitution = value;
+            if (IsSimulated) _body.Restitution = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the linear damping of this Rigidbody3D.
+    /// The fraction of linear velocity removed every 1/60 s, whatever the fixed timestep. Range: 0 to 1.
+    /// </summary>
+    public float LinearDamping
+    {
+        get => linearDamping;
+        set
+        {
+            AssertOwner();
+            if (value < 0.0 || value > 1.0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Linear damping must be between 0 and 1.");
+
+            linearDamping = value;
+            if (IsSimulated) ApplyDamping(_body);
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the angular damping of this Rigidbody3D.
+    /// The fraction of angular velocity removed every 1/60 s, whatever the fixed timestep. Range: 0 to 1.
+    /// </summary>
+    public float AngularDamping
+    {
+        get => angularDamping;
+        set
+        {
+            AssertOwner();
+            if (value < 0.0 || value > 1.0)
+                throw new ArgumentOutOfRangeException(nameof(value), "Angular damping must be between 0 and 1.");
+
+            angularDamping = value;
+            if (IsSimulated) ApplyDamping(_body);
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets whether gyroscopic forces are enabled for this Rigidbody3D.
+    /// Useful for spinning objects with high inertia anisotropy (like propellers).
+    /// </summary>
+    public bool EnableGyroscopicForces
+    {
+        get => enableGyroscopicForces;
+        set
+        {
+            AssertOwner();
+            enableGyroscopicForces = value;
+            if (IsSimulated) _body.EnableGyroscopicForces = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the deactivation time in seconds.
+    /// The body sleeps if velocity stays below threshold for this duration.
+    /// </summary>
+    public float DeactivationTime
+    {
+        get => deactivationTime;
+        set
+        {
+            AssertOwner();
+            deactivationTime = value;
+            if (IsSimulated) _body.DeactivationTime = System.TimeSpan.FromSeconds(value);
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the linear velocity threshold for sleeping.
+    /// </summary>
+    public float LinearSleepThreshold
+    {
+        get => linearSleepThreshold;
+        set
+        {
+            AssertOwner();
+            linearSleepThreshold = value;
+            if (IsSimulated) _body.DeactivationThreshold = (_body.DeactivationThreshold.angular, value);
+        }
+    }
+
+    /// <summary>
+    /// Gets or sets the angular velocity threshold for sleeping (radians/second).
+    /// </summary>
+    public float AngularSleepThreshold
+    {
+        get => angularSleepThreshold;
+        set
+        {
+            AssertOwner();
+            angularSleepThreshold = value;
+            if (IsSimulated) _body.DeactivationThreshold = (value, _body.DeactivationThreshold.linear);
+        }
+    }
+
+    /// <summary>
+    /// Gets whether this Rigidbody3D is currently active (not sleeping).
+    /// </summary>
+    public bool IsActive => _body?.IsActive ?? false;
+
+    /// <summary>
+    /// Gets or sets the Linear Velocity of this Rigidbody3D.
+    /// </summary>
+    public Float3 LinearVelocity
+    {
+        get => _body == null ? Float3.Zero : _body.Velocity.ToProwl();
+        set { AssertOwner(); if (TryGetMovingBody(out RigidBody body)) body.Velocity = value.ToJitter(); }
+    }
+
+    /// <summary>
+    /// Gets or sets the Angular Velocity of this Rigidbody3D.
+    /// </summary>
+    public Float3 AngularVelocity
+    {
+        get => _body == null ? Float3.Zero : _body.AngularVelocity.ToProwl();
+        set { AssertOwner(); if (TryGetMovingBody(out RigidBody body)) body.AngularVelocity = value.ToJitter(); }
+    }
+
+    /// <summary>
+    /// Where the simulation has the body right now. The Transform is interpolated between steps and
+    /// trails this, so anything acting on the body at a point should measure from here.
+    /// </summary>
+    public Float3 Position => IsSimulated ? OriginOf(_body.Position, _body.Orientation) : Transform.Position;
+
+    /// <summary>The simulated orientation, without the interpolation the Transform shows. See <see cref="Position"/>.</summary>
+    public Quaternion Rotation => IsSimulated ? _body.Orientation.ToProwl() : Transform.Rotation;
+
+    /// <summary>
+    /// Gets or sets the Torque of this Rigidbody3D.
+    /// </summary>
+    public Float3 Torque
+    {
+        get => _body == null ? Float3.Zero : _body.Torque.ToProwl();
+        set { AssertOwner(); if (TryGetMovingBody(out RigidBody body)) body.Torque = value.ToJitter(); }
+    }
+
+    [SerializeIgnore]
+    private RigidBody? _body;
+
+    /// <summary>The physics engine's body, or null while there is none.</summary>
+    internal RigidBody? Native => _body;
+
+    /// <summary>Whether this rigidbody has a body in the physics world right now.</summary>
+    [MemberNotNullWhen(true, nameof(_body), nameof(Native))]
+    internal bool IsSimulated => _body?.IsValid == true;
+
+    /// <summary>The body's effective inertia in world space, with zero response on locked axes.</summary>
+    internal JMatrix WorldInertia => IsSimulated
+        ? MathHelper.PseudoInverseSymmetric(_body.Data.InverseInertiaWorld.ToMatrix())
+        : default;
+
+    /// <summary>
+    /// Ensures the underlying Jitter body exists. Body creation normally happens in OnEnable, but
+    /// game code can touch a rigidbody (e.g. set velocity or add a force) in the same frame it is
+    /// added, before OnEnable runs create it on demand so those calls don't hit a null body.
+    /// </summary>
+    private void EnsureBody()
+    {
+        if (IsSimulated) return;
+        Scene? scene = GameObject.IsValid() ? GameObject.Scene : null;
+        World? world = scene.IsValid() ? scene.Physics?.World : null;
+        if (world != null) CreateBody(world);
+    }
+
+    public RigidBody CreateBody(World world)
+    {
+        _body = world.CreateRigidBody();
+        _appliedCenterOfMass = LocalCenterOfMass;
+        UpdateProperties(_body);
+        UpdateShapes(_body);
+        UpdateTransform(_body);
+        _lastSyncedTransformVersion = Transform.Version; // initial pose is already in the body
+        Scene? scene = GameObject.IsValid() ? GameObject.Scene : null;
+        PhysicsWorld physics = scene.IsValid() ? scene.Physics : null;
+        physics?.RegisterBody(this);
+        physics?.RebindConstraints(this);
+
+        return _body;
+    }
+
+    public override void OnValidate()
+    {
+        if (GameObject.IsNotValid() || GameObject.Scene.IsNotValid()) return;
+
+        World? world = GameObject.Scene.Physics?.World;
+        if (world == null) return;
+
+        // Route through CreateBody so a body created here is wired up the same as one from OnEnable.
+        // A raw CreateRigidBody would leave the collision events unhooked and the body out of the
+        // transform-sync set, and OnEnable would then skip creation because a body already exists.
+        if (!IsSimulated)
+        {
+            CreateBody(world);
+            return;
+        }
+
+        Float3 shift = LocalCenterOfMass - _appliedCenterOfMass;
+        _appliedCenterOfMass = LocalCenterOfMass;
+        UpdateProperties(_body);
+        UpdateShapes(_body);
+        UpdateTransform(_body);
+        if (!shift.Equals(Float3.Zero)) ShiftJointAnchors(shift);
+    }
+
+    /// <summary>
+    /// Writes the simulated pose onto the Transform. Called each frame by the physics world, only for
+    /// bodies that moved in the last step.
+    /// </summary>
+    internal void WritePose()
+    {
+        if (!IsSimulated) return;
+
+        // Dynamic AND kinematic bodies move within the simulation (kinematic via LinearVelocity /
+        // MovePosition), so the transform must follow the body. Only static bodies don't move - writing
+        // their pose back would clobber a script-set transform. (This body->transform readback is
+        // independent of AutoSyncTransforms, which only governs the transform->body direction.)
+        if (motionType == MotionType.Static) return;
+
+        // Something moved the Transform since the last sync, so it wins over the simulated pose.
+        if (Transform.Version != _lastSyncedTransformVersion)
+        {
+            SyncTransformToBody();
+            return;
+        }
+
+        Float3 position;
+        Quaternion rotation;
+
+        if (interpolation == RigidbodyInterpolation.None || !_hasPose)
+        {
+            position = OriginOf(_body.Position, _body.Orientation);
+            rotation = _body.Orientation.ToProwl();
+        }
+        else if (interpolation == RigidbodyInterpolation.Extrapolate)
+        {
+            _body.PredictPose(Time.FixedAccumulator, out JVector predicted, out JQuaternion predictedOrientation);
+            position = OriginOf(predicted, predictedOrientation);
+            rotation = predictedOrientation.ToProwl();
+        }
+        else
+        {
+            // Render between the last two steps. The visual trails the simulation by up to one fixed
+            // step, which is the price of never overshooting into geometry the solver has not seen.
+            float t = Time.FixedAlpha;
+            position = Maths.Lerp(_previousPosition, _currentPosition, t);
+            rotation = Quaternion.Slerp(_previousRotation, _currentRotation, t);
+        }
+
+        _writingPose = true;
+        try
+        {
+            Transform.Position = position;
+            Transform.Rotation = rotation;
+        }
+        finally
+        {
+            _writingPose = false;
+        }
+
+        // Remember the version we just wrote so the transform->body sync doesn't treat this
+        // physics-driven change as a user edit and push it straight back.
+        _lastSyncedTransformVersion = Transform.Version;
+    }
+
+    /// <summary>
+    /// Records the pose the step just produced, so the next frames can render between it and the one
+    /// before. Driven by the physics world for every awake body right after the step.
+    /// </summary>
+    internal void CapturePose()
+    {
+        if (!IsSimulated) return;
+
+        _previousPosition = _currentPosition;
+        _previousRotation = _currentRotation;
+        _currentPosition = OriginOf(_body.Position, _body.Orientation);
+        _currentRotation = _body.Orientation.ToProwl();
+
+        if (!_hasPose)
+        {
+            _previousPosition = _currentPosition;
+            _previousRotation = _currentRotation;
+            _hasPose = true;
+        }
+    }
+
+    /// <summary>Whether the last two captured poses match, so interpolation has nothing left to move.</summary>
+    internal bool PoseSettled => !_hasPose || (_previousPosition.Equals(_currentPosition) && _previousRotation == _currentRotation);
+
+    /// <summary>
+    /// Drops the interpolation history so a teleport snaps instead of being smeared across a frame.
+    /// </summary>
+    private void ResetPose()
+    {
+        if (!IsSimulated) { _hasPose = false; return; }
+
+        _currentPosition = _previousPosition = OriginOf(_body.Position, _body.Orientation);
+        _currentRotation = _previousRotation = _body.Orientation.ToProwl();
+        _hasPose = true;
+    }
+
+
+    public override void OnEnable()
+    {
+        if (!IsSimulated)
+        {
+            CreateBody(GameObject.Scene.Physics.World);
+        }
+
+        // Claim all child colliders that aren't already claimed
+        ClaimChildColliders();
+    }
+
+    /// <summary>
+    /// Claims all colliders in this GameObject and its children that aren't already claimed by another rigidbody.
+    /// </summary>
+    private void ClaimChildColliders()
+    {
+        if (!IsSimulated)
+            return;
+
+        // Get all colliders in this GameObject and its children
+        IEnumerable<Collider> colliders = GetComponentsInChildren<Collider>();
+
+        // A collider under a nested rigidbody belongs to that one, not to this.
+        foreach (Collider collider in colliders)
+            if (ReferenceEquals(collider.FindOwningRigidbody(), this))
+                collider.TryAttachTo(this);
+    }
+
+    public override void OnDisable()
+    {
+        if (!IsSimulated) return;
+
+        // Take the colliders off while the body is still alive, so their shapes are removed cleanly.
+        Collider[] colliders = [.. GetComponentsInChildren<Collider>()];
+        foreach (Collider collider in colliders)
+            if (collider.IsValid()) collider.Detach();
+
+        GameObject.Scene.Physics.UnregisterBody(this);
+        GameObject.Scene.Physics.World?.Remove(_body);
+
+        // Only now that this body is gone will the colliders resolve past it, onto an outer rigidbody
+        // or their layer's static body.
+        foreach (Collider collider in colliders)
+            if (collider.IsValid() && collider.EnabledInHierarchy) collider.Reattach();
+    }
+
+    /// <summary>Converts the per 1/60 s damping into the per step factor Jitter applies.</summary>
+    internal void ApplyDamping(RigidBody rb)
+    {
+        float steps = Time.FixedDeltaTime * 60.0f;
+        rb.Damping = (1.0f - MathF.Pow(1.0f - linearDamping, steps), 1.0f - MathF.Pow(1.0f - angularDamping, steps));
+    }
+
+    internal void UpdateProperties(RigidBody rb)
+    {
+        ClampSettings();
+        rb.MotionType = motionType;
+        rb.AllowedMotion = MotionAxes.All & ~(MotionAxes)constraints;
+        rb.EnableCcd = isSpeculative;
+        ApplyDamping(rb);
+        rb.Friction = friction;
+        rb.AffectedByGravity = useGravity;
+        rb.Restitution = restitution;
+        rb.EnableGyroscopicForces = enableGyroscopicForces;
+        rb.DeactivationTime = System.TimeSpan.FromSeconds(deactivationTime);
+        rb.DeactivationThreshold = (angularSleepThreshold, linearSleepThreshold);
+        rb.Tag = new RigidBodyUserData()
+        {
+            Rigidbody = this,
+            InstanceID = this.InstanceID,
+            Layer = GameObject.LayerIndex,
+        };
+        // Mass/inertia is set by RegisterShapes after colliders attach their shapes.
+        // Calling rb.SetMassInertia(mass) here would iterate all currently-attached shapes,
+        // which throws for TriangleShape (no volume). The fallback in UpdateShapes handles
+        // the no-collider case.
+    }
+
+    // The inspector and serialized data write the fields directly, so bring them into the ranges the physics body accepts.
+    private void ClampSettings()
+    {
+        linearDamping = Math.Clamp(linearDamping, 0f, 1f);
+        angularDamping = Math.Clamp(angularDamping, 0f, 1f);
+        friction = MathF.Max(friction, 0f);
+        restitution = Math.Clamp(restitution, 0f, 1f);
+        deactivationTime = MathF.Max(deactivationTime, 0f);
+        linearSleepThreshold = MathF.Max(linearSleepThreshold, 0f);
+        angularSleepThreshold = MathF.Max(angularSleepThreshold, 0f);
+        inertiaOverride = Maths.Max(inertiaOverride, new Float3(1e-6f));
+    }
+
+    private const float MinMass = 0.001f;
+
+    /// <summary>
+    /// Pushes <see cref="Mass"/> onto the Jitter body, deriving the inertia tensor from its shapes.
+    /// Shapes with no volume (the TriangleShapes of a concave MeshCollider) cannot report inertia, so
+    /// those bodies fall back to a solid box sized to the combined bounds of every attached shape - a
+    /// rough tensor that still rotates plausibly beats no body at all.
+    /// </summary>
+    internal void ApplyMassInertia()
+    {
+        if (!IsSimulated) return;
+
+        mass = MathF.Max(mass, MinMass);
+        if (overrideInertia)
+        {
+            JSymmetricMatrix diagonal = JSymmetricMatrix.Identity;
+            diagonal.M11 = inertiaOverride.X;
+            diagonal.M22 = inertiaOverride.Y;
+            diagonal.M33 = inertiaOverride.Z;
+            _body.SetMassInertia(diagonal, mass);
+            return;
+        }
+
+        try
+        {
+            _body.SetMassInertia(mass);
+        }
+        catch (NotSupportedException)
+        {
+            _body.SetMassInertia(ApproximateBoxInertia(_body.Shapes, mass), mass);
+        }
+    }
+
+    private static JSymmetricMatrix ApproximateBoxInertia(ReadOnlyList<RigidBodyShape> shapes, float mass)
+    {
+        if (shapes.Count == 0) return JSymmetricMatrix.Identity;
+
+        JVector min = new(float.MaxValue, float.MaxValue, float.MaxValue);
+        JVector max = new(float.MinValue, float.MinValue, float.MinValue);
+        foreach (RigidBodyShape shape in shapes)
+        {
+            shape.CalculateBoundingBox(JQuaternion.Identity, JVector.Zero, out JBoundingBox box);
+            min = JVector.Min(min, box.Min);
+            max = JVector.Max(max, box.Max);
+        }
+
+        // Clamp to a small positive size so the tensor stays positive-definite (invertible) even for
+        // perfectly flat or degenerate meshes.
+        float sx = Maths.Max(max.X - min.X, 1e-3f);
+        float sy = Maths.Max(max.Y - min.Y, 1e-3f);
+        float sz = Maths.Max(max.Z - min.Z, 1e-3f);
+
+        JSymmetricMatrix inertia = JSymmetricMatrix.Identity;
+        inertia.M11 = (1.0f / 12.0f) * mass * (sy * sy + sz * sz);
+        inertia.M22 = (1.0f / 12.0f) * mass * (sx * sx + sz * sz);
+        inertia.M33 = (1.0f / 12.0f) * mass * (sx * sx + sy * sy);
+        return inertia;
+    }
+
+    internal void UpdateShapes(RigidBody rb)
+    {
+        // Drop the owner entries first: the colliders below re-register their own shapes, but a shape
+        // left over from a collider that has since gone would otherwise linger in the world's map.
+        PhysicsWorld physics = GameObject.IsValid() && GameObject.Scene.IsValid() ? GameObject.Scene.Physics : null;
+        if (physics != null)
+            foreach (RigidBodyShape shape in rb.Shapes)
+                physics.UnregisterShapeOwner(shape);
+
+        // Remove all shapes from this rigidbody (Preserve mass/inertia, the rebuild below will refresh it)
+        rb.RemoveShapes(rb.Shapes, MassInertiaUpdateMode.Preserve);
+
+        // Get all child colliders and have them re-attach
+        IEnumerable<Collider> colliders = GetComponentsInChildren<Collider>();
+        foreach (Collider collider in colliders)
+        {
+            // Detach the collider first (in case it's attached to us or static)
+            collider.Detach();
+            // Then try to attach it to this rigidbody
+            collider.TryAttachTo(this);
+        }
+
+        // If no colliders provided shapes, RegisterShapes was never called and mass was never set.
+        if (rb.Shapes.Count == 0)
+            ApplyMassInertia();
+    }
+
+    /// <summary>Unconditionally pushes the Transform pose into the body. WHEN this runs is controlled
+    /// by the caller (initial creation, the pre-step sync, or an auto-synced query).</summary>
+    internal void UpdateTransform(RigidBody rb)
+    {
+        rb.Position = BodyPosition(Transform.Position, Transform.Rotation);
+        rb.Orientation = Transform.Rotation.ToJitter();
+        ResetPose();
+    }
+
+    /// <summary>
+    /// Pushes the Transform into the physics body, but only if the Transform changed since the last
+    /// sync (a genuine user edit) - so it never clobbers the simulated pose. Called by the physics
+    /// world before each step when AutoSyncTransforms is on, and by SyncTransforms.
+    /// </summary>
+    /// <summary>
+    /// The pose a joint made now should be built against. That is the simulated pose, since the Transform is
+    /// interpolated between steps and can trail it by a whole step, unless the Transform was moved since the last
+    /// sync, in which case that move is what the body is about to take. False when there is no simulated body.
+    /// </summary>
+    internal bool TryGetJointPose(out Float3 position, out Quaternion rotation)
+    {
+        if (!IsSimulated || Transform.Version != _lastSyncedTransformVersion)
+        {
+            position = default;
+            rotation = default;
+            return false;
+        }
+
+        position = OriginOf(_body.Position, _body.Orientation);
+        rotation = _body.Orientation.ToProwl();
+        return true;
+    }
+
+    void ITransformChangeListener.TransformChanged()
+    {
+        if (!_writingPose) QueueSync();
+    }
+
+    /// <summary>Asks the physics world to push this body's Transform and layer into it before the next step.</summary>
+    internal void QueueSync() => SyncWorld?.QueueSync(this);
+
+    internal void SyncTransformToBody()
+    {
+        if (!IsSimulated) return;
+
+        if (_body.Tag is RigidBodyUserData data && data.Layer != GameObject.LayerIndex)
+        {
+            data.Layer = GameObject.LayerIndex;
+            if (GameObject.Scene.IsValid()) GameObject.Scene.Physics?.MarkContactFiltersChanged();
+        }
+
+        if (Transform.Version == _lastSyncedTransformVersion) return;
+        UpdateTransform(_body);
+        _lastSyncedTransformVersion = Transform.Version;
+
+        // Colliders on this GameObject are not watched by the world, so a rescale reaches them from here.
+        foreach (Collider collider in GameObject.GetComponents<Collider>())
+            if (collider.EnabledInHierarchy && collider.AttachedRigidbody == this) collider.RefreshPlacement();
+    }
+
+    /// <summary>
+    /// Applies a force through the body's centre of mass, so it accelerates without spinning.
+    /// </summary>
+    public void AddForce(Float3 force, ForceMode mode = ForceMode.Force)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jForce = force.ToJitter();
+        switch (mode)
+        {
+            case ForceMode.Force:
+                body.AddForce(jForce);
+                break;
+
+            case ForceMode.Acceleration:
+                // a = F/m, so cancelling the mass means asking for a force of m*a.
+                if (body.MotionType == MotionType.Dynamic) body.AddForce(jForce * body.Mass);
+                break;
+
+            case ForceMode.Impulse:
+                body.ApplyImpulse(jForce);
+                body.SetActivationState(true);
+                break;
+
+            case ForceMode.VelocityChange:
+                body.Velocity += jForce;
+                body.SetActivationState(true);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Applies a force at a world-space point, which also spins the body about its centre of mass.
+    /// Only <see cref="ForceMode.Force"/> and <see cref="ForceMode.Impulse"/> are meaningful here; the
+    /// mass-independent modes have no defined torque.
+    /// </summary>
+    public void AddForceAtPosition(Float3 force, Float3 worldPosition, ForceMode mode = ForceMode.Force)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jForce = force.ToJitter();
+        JVector jPosition = worldPosition.ToJitter();
+
+        if (mode == ForceMode.Impulse)
+        {
+            ApplyImpulse(force, worldPosition);
+            return;
+        }
+
+        if (mode == ForceMode.Acceleration)
+        {
+            if (body.MotionType != MotionType.Dynamic) return;
+            jForce *= body.Mass;
+        }
+
+        body.AddForce(jForce, jPosition);
+    }
+
+    /// <summary>
+    /// Applies a torque about the body's centre of mass.
+    /// </summary>
+    public void AddTorque(Float3 torque, ForceMode mode = ForceMode.Force)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jTorque = torque.ToJitter();
+
+        switch (mode)
+        {
+            case ForceMode.Force:
+                body.Torque += jTorque;
+                body.SetActivationState(true);
+                break;
+
+            case ForceMode.Acceleration:
+                // Cancelling the inertia means asking for a torque of I*alpha, both in world space.
+                body.Torque += JVector.Transform(jTorque, WorldInertia);
+                body.SetActivationState(true);
+                break;
+
+            case ForceMode.Impulse:
+                ApplyAngularImpulse(torque);
+                break;
+
+            case ForceMode.VelocityChange:
+                body.AngularVelocity += jTorque;
+                body.SetActivationState(true);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// The live body, creating it on demand. False when this component cannot have one (no scene yet,
+    /// or it has been removed), which is the cue for every mutator to do nothing rather than throw.
+    /// </summary>
+    private bool TryGetBody(out RigidBody body)
+    {
+        EnsureBody();
+        body = _body;
+        return body?.IsValid == true;
+    }
+
+    /// <summary>As <see cref="TryGetBody"/>, but false for a static body, which has no velocity to change.</summary>
+    private bool TryGetMovingBody(out RigidBody body) => TryGetBody(out body) && motionType != MotionType.Static;
+
+    /// <summary>
+    /// Sets the activation state of this rigidbody (awake or sleeping).
+    /// </summary>
+    public void SetActive(bool active)
+    {
+        AssertOwner();
+        if (IsSimulated)
+            _body.SetActivationState(active);
+    }
+
+    /// <summary>
+    /// Gets the velocity at a world space point on this rigidbody.
+    /// </summary>
+    public Float3 GetPointVelocity(Float3 worldPoint)
+    {
+        if (_body == null) return Float3.Zero;
+
+        JVector point = worldPoint.ToJitter();
+        JVector r = point - _body.Position;
+        JVector velocity = _body.Velocity + JVector.Cross(_body.AngularVelocity, r);
+
+        return velocity.ToProwl();
+    }
+
+    /// <summary>
+    /// The centre of mass in world space, derived from the attached shapes and their offsets.
+    /// <para/>
+    /// This is not the point the body spins about, which is its origin, or <see cref="CenterOfMassOverride"/>
+    /// when set. Setting that to this point, moved into the body's space, makes the body turn the way its shapes
+    /// weigh. Shapes with no volume (a concave MeshCollider's triangles) contribute nothing, and a body made only
+    /// of those reports its origin.
+    /// </summary>
+    public Float3 CenterOfMass
+    {
+        get
+        {
+            if (!IsSimulated) return Transform.Position;
+
+            JVector weighted = JVector.Zero;
+            float totalMass = 0.0f;
+
+            foreach (RigidBodyShape shape in _body.Shapes)
+            {
+                try
+                {
+                    shape.CalculateMassInertia(out _, out JVector shapeCenter, out float shapeMass);
+                    weighted += shapeCenter * shapeMass;
+                    totalMass += shapeMass;
+                }
+                catch (NotSupportedException)
+                {
+                    // A volumeless shape (a concave MeshCollider's triangles) has no mass to weigh.
+                }
+            }
+
+            // Body-local, because the shape offsets are; fall back to the origin when nothing weighed in.
+            if (totalMass <= 0.0f) return Position;
+            JVector world = _body.Position + JVector.Transform(weighted * (1.0f / totalMass), _body.Orientation);
+            return world.ToProwl();
+        }
+    }
+
+    /// <summary>
+    /// The diagonal of this body's inertia tensor in body space, in kg*m^2. Only the moments about the
+    /// body's own axes; a shape whose principal axes are rotated relative to the body also has
+    /// off-diagonal terms that this does not report.
+    /// </summary>
+    public Float3 InertiaTensor
+    {
+        get
+        {
+            // Reciprocals of the inverse diagonal are not the moments unless the tensor is diagonal,
+            // so invert the matrix properly.
+            if (_body == null || !JSymmetricMatrix.Inverse(_body.InverseInertia, out JSymmetricMatrix inertia))
+                return Float3.One;
+
+            return new Float3(inertia.M11, inertia.M22, inertia.M33);
+        }
+    }
+
+    /// <summary>
+    /// Applies an impulse at a position, immediately affecting velocity.
+    /// </summary>
+    public void ApplyImpulse(Float3 impulse, Float3 worldPosition)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jImpulse = impulse.ToJitter();
+        JVector jPosition = worldPosition.ToJitter();
+
+        body.ApplyImpulse(jImpulse, jPosition);
+
+        SetActive(true);
+    }
+
+    /// <summary>
+    /// Applies an impulse to the rigidbody, immediately affecting velocity.
+    /// </summary>
+    public void ApplyImpulse(Float3 impulse)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jImpulse = impulse.ToJitter();
+        body.ApplyImpulse(jImpulse);
+
+        SetActive(true);
+    }
+
+    /// <summary>
+    /// Applies an angular impulse to the rigidbody, immediately affecting angular velocity.
+    /// </summary>
+    public void ApplyAngularImpulse(Float3 angularImpulse)
+    {
+        AssertOwner();
+        if (!TryGetMovingBody(out RigidBody body)) return;
+
+        JVector jImpulse = angularImpulse.ToJitter();
+        body.AngularVelocity += JVector.Transform(jImpulse, body.Data.InverseInertiaWorld);
+
+        SetActive(true);
+    }
+
+    /// <summary>
+    /// Moves the rigidbody to a new position (teleport).
+    /// </summary>
+    public void MovePosition(Float3 position)
+    {
+        AssertOwner();
+        if (!TryGetBody(out RigidBody body)) return;
+
+        body.Position = BodyPosition(position, body.Orientation.ToProwl());
+        body.SetActivationState(true);
+
+        // Static bodies never read their pose back, so the Transform has to be taken along explicitly.
+        Transform.Position = position;
+        _lastSyncedTransformVersion = Transform.Version;
+        ResetPose();
+    }
+
+    /// <summary>
+    /// Rotates the rigidbody to a new rotation about its origin (teleport).
+    /// </summary>
+    public void MoveRotation(Quaternion rotation)
+    {
+        AssertOwner();
+        if (!TryGetBody(out RigidBody body)) return;
+
+        body.Position = BodyPosition(OriginOf(body.Position, body.Orientation), rotation);
+        body.Orientation = rotation.ToJitter();
+        body.SetActivationState(true);
+
+        Transform.Rotation = rotation;
+        _lastSyncedTransformVersion = Transform.Version;
+        ResetPose();
+    }
+}

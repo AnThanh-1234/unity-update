@@ -1,0 +1,177 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Jitter2;
+using Jitter2.Dynamics;
+using Jitter2.Dynamics.Constraints;
+using Jitter2.LinearMath;
+
+using Prowl.Echo;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+/// <summary>
+/// Constrains the relative twist of two bodies around specified axes.
+/// This constraint removes one angular degree of freedom when the limit is enforced.
+/// </summary>
+[AddComponentMenu("Physics/Constraints/Twist Angle")]
+public class TwistAngleConstraint : PhysicsConstraint
+{
+    [SerializeField] private Float3 axis1 = Float3.UnitX;
+    [SerializeField] private Float3 axis2 = Float3.UnitX;
+    [SerializeField] private float minAngle = -45.0f;
+    [SerializeField] private float maxAngle = 45.0f;
+    [SerializeField] private float softness = 0.0001f;
+    [SerializeField] private float biasFactor = 0.2f;
+
+    private TwistAngle constraint;
+
+    /// <summary>
+    /// The first twist axis in local space of this rigidbody.
+    /// </summary>
+    public Float3 Axis1
+    {
+        get => axis1;
+        set
+        {
+            axis1 = RequireAxis(value);
+            RecreateConstraint();
+        }
+    }
+
+    /// <summary>
+    /// The second twist axis in local space of the connected rigidbody.
+    /// If no connected body is specified, this is in world space.
+    /// </summary>
+    public Float3 Axis2
+    {
+        get => axis2;
+        set
+        {
+            axis2 = RequireAxis(value);
+            RecreateConstraint();
+        }
+    }
+
+    /// <summary>
+    /// Minimum twist angle in degrees. Default is -45.
+    /// </summary>
+    public float MinAngle
+    {
+        get => minAngle;
+        set
+        {
+            minAngle = value;
+            UpdateLimits();
+        }
+    }
+
+    /// <summary>
+    /// Maximum twist angle in degrees. Default is 45.
+    /// </summary>
+    public float MaxAngle
+    {
+        get => maxAngle;
+        set
+        {
+            maxAngle = value;
+            UpdateLimits();
+        }
+    }
+
+    /// <summary>
+    /// Softness of the constraint. Higher values make the constraint softer.
+    /// </summary>
+    public float Softness
+    {
+        get => softness;
+        set
+        {
+            softness = value;
+            if (IsLive(constraint)) constraint.Softness = value;
+        }
+    }
+
+    /// <summary>
+    /// Bias factor for error correction. Higher values correct errors faster.
+    /// </summary>
+    public float BiasFactor
+    {
+        get => biasFactor;
+        set
+        {
+            biasFactor = value;
+            if (IsLive(constraint)) constraint.Bias = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets the current twist angle in degrees.
+    /// </summary>
+    public float Angle
+    {
+        get
+        {
+            if (!IsLive(constraint)) return 0.0f;
+            return constraint.Angle.Degree;
+        }
+    }
+
+    /// <summary>
+    /// Gets the accumulated impulse applied by this constraint.
+    /// </summary>
+    public float Impulse => IsLive(constraint) ? constraint.Impulse : 0.0f;
+
+    protected override Constraint GetConstraint() => constraint;
+
+    protected override void CreateConstraint(World world, RigidBody body1, RigidBody body2)
+    {
+        JVector worldAxis1 = LocalDirToWorld(axis1, Body1.Transform);
+        JVector worldAxis2 = connectedBody.IsValid()
+            ? LocalDirToWorld(axis2, connectedBody.Transform)
+            : axis2.ToJitter();
+
+        constraint = world.CreateConstraint<TwistAngle>(body1, body2);
+
+        var limit = AngularLimit.FromDegree(minAngle, maxAngle);
+        constraint.Initialize(worldAxis1, worldAxis2, limit);
+
+        constraint.Softness = softness;
+        constraint.Bias = biasFactor;
+    }
+
+    protected override void DestroyConstraint()
+    {
+        RemoveConstraint(constraint);
+        constraint = null;
+    }
+
+    private void UpdateLimits()
+    {
+        if (IsLive(constraint))
+        {
+            var limit = AngularLimit.FromDegree(minAngle, maxAngle);
+            constraint.Limit = limit;
+        }
+    }
+
+    public override void DrawGizmos() => DrawJointMarker(WorldPivot);
+
+    // Twist is the angle between two directions that each belong to one of the bodies, so both are
+    // drawn: this body's in cyan, the other's in orange, with the allowed twist swept between them.
+    public override void DrawGizmosSelected()
+    {
+        float scale = GizmoScale;
+        Float3 pivot = WorldPivot;
+        Float3 a = WorldAxis(axis1);
+        Float3 b = WorldConnectedAxis(axis2);
+
+        DrawJointMarker(pivot);
+        Debug.DrawAxisLine(pivot, a, scale * 1.2f, AnchorColor);
+        Debug.DrawAxisLine(pivot, b, scale * 1.0f, ConnectedColor);
+
+        Debug.PerpendicularAxes(a, out Float3 zero, out _);
+        Debug.DrawArcRange(pivot, a, zero, scale * 0.7f, minAngle, maxAngle, RangeColor, LimitColor);
+    }
+}

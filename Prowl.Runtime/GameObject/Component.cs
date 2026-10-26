@@ -1,0 +1,660 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Threading;
+
+using Prowl.Echo;
+using Prowl.PaperUI;
+using Prowl.Runtime.Rendering;
+using Prowl.Runtime.Resources;
+using Prowl.Runtime.Tasks;
+using Prowl.Vector;
+
+using Prowl.Ember;
+
+namespace Prowl.Runtime;
+
+/// <summary>
+/// Represents the base class for all scripts that attach to GameObjects in the Prowl Game Engine.
+/// <see cref="Component"/> provides lifecycle methods for game object behaviors.
+/// </summary>
+public abstract class Component : EngineObject, ISerializationCallbackReceiver
+{
+    [SerializeField, HideInInspector]
+    private Guid _identifier = Guid.NewGuid();
+
+    // The identifier stored in the data this component was last loaded from. A scene load restores it.
+    [SerializeIgnore]
+    internal Guid _loadedIdentifier;
+
+    // On the component rather than in a table keyed by component identifier: identifiers are handed out
+    // fresh by every load, so such a table goes stale wherever a copy forgets to rewrite its keys.
+    // Written out only when set, so an ordinary component costs nothing in a scene file.
+    [SerializeField, HideInInspector, SerializeIf(nameof(IsFromPrefab))]
+    private Guid _prefabTemplateIdentity;
+
+    /// <summary>Whether this component came from a prefab.</summary>
+    public bool IsFromPrefab => _prefabTemplateIdentity != Guid.Empty;
+
+    [SerializeField, HideInInspector]
+    protected internal bool _enabled = true;
+    [SerializeField, HideInInspector]
+    protected internal bool _enabledInHierarchy = true;
+
+    private GameObject _go;
+
+    /// <summary>
+    /// Gets or sets the hide flags for this Component.
+    /// </summary>
+    [HideInInspector]
+    public HideFlags HideFlags;
+
+    [SerializeIgnore]
+    private bool _hasStarted = false;
+
+    [SerializeIgnore]
+    private bool _hasBeenEnabled = false;
+
+    /// <summary>Whether gameplay OnEnable ran and OnDisable has not yet. Start, the updates and physics callbacks need it, and OnDisable pairs with it.</summary>
+    [SerializeIgnore]
+    private bool _gameplayEnabled;
+
+    [SerializeIgnore]
+    private bool? _executeAlwaysCached;
+
+    [SerializeIgnore]
+    private CancellationTokenSource? _destroyCancellation;
+
+    /// <summary>
+    /// Cancelled when this component is destroyed. Pass it to async work that should stop with the component.
+    /// </summary>
+    public CancellationToken DestroyCancellationToken
+    {
+        get
+        {
+            CancellationTokenSource? cancellation = Volatile.Read(ref _destroyCancellation);
+            if (cancellation == null && !IsDisposed)
+            {
+                var created = new CancellationTokenSource();
+                cancellation = Interlocked.CompareExchange(ref _destroyCancellation, created, null) ?? created;
+            }
+
+            // Checked after creating too, in case disposal ran in between and never saw the new source.
+            return cancellation == null || IsDisposed ? new CancellationToken(true) : cancellation.Token;
+        }
+    }
+
+    // Dispatch state, owned by SceneDispatcher. All four are derived from this component's type or its place
+    // in the scene, so all four are opted out of hot reload and re-derived from the new type afterwards. Each
+    // one treats its default value as "not known yet", so arriving zeroed is always the safe outcome.
+
+    /// <summary>Which optional callbacks this component's type overrides. Resolved on first dispatch.</summary>
+    [SerializeIgnore, ReloadIgnore]
+    internal SceneCallbacks _callbacks;
+
+    /// <summary>One past the index in the dispatcher's registration array. Zero means not registered.</summary>
+    [SerializeIgnore, ReloadIgnore]
+    internal int _dispatchSlot;
+
+    /// <summary>Whether the dispatcher counts this component among the scene's collision listeners.</summary>
+    [SerializeIgnore, ReloadIgnore]
+    internal bool _countedCollisionListener;
+
+    /// <summary>Cached [ExecutionOrder], the primary sort key for every per-frame channel.</summary>
+    [SerializeIgnore, ReloadIgnore]
+    internal int _dispatchOrder;
+
+    /// <summary>Registration counter, the tie-break that keeps equal execution orders in registration order.</summary>
+    [SerializeIgnore, ReloadIgnore]
+    internal int _dispatchSequence;
+
+    /// <summary>
+    /// Whether this component's gameplay methods should execute.
+    /// True when in play mode, or when the component has [ExecuteAlways].
+    /// </summary>
+    internal bool ShouldExecuteGameplay
+    {
+        get
+        {
+            _executeAlwaysCached ??= GetType().IsDefined(typeof(ExecuteAlwaysAttribute), true);
+            return Application.IsPlaying || _executeAlwaysCached.Value;
+        }
+    }
+
+    /// <summary>
+    /// Whether gameplay callbacks run now. A component enabled while gameplay was gated off, such as the edit
+    /// scene in the frame play mode starts, stays inert until it is enabled again.
+    /// </summary>
+    internal bool RunsGameplay => _gameplayEnabled && ShouldExecuteGameplay;
+
+    /// <summary>
+    /// Gets the identifier for this Component.
+    /// Generally shouldnt be set manually
+    /// </summary>
+    public Guid Identifier { get => _identifier; set => _identifier = value; }
+
+    /// <summary>
+    /// The identifier of the component in the prefab this one came from, or Guid.Empty when it is not
+    /// part of a prefab.
+    /// </summary>
+    public Guid SourceIdentifier
+    {
+        get => _prefabTemplateIdentity;
+        internal set => _prefabTemplateIdentity = value;
+    }
+
+    /// <summary>
+    /// Gets the GameObject this Component is attached to.
+    /// </summary>
+    public GameObject GameObject => _go;
+
+    private protected override bool DestroyQueuedByOwner => _go.IsValid() && _go.IsDestroyQueued;
+
+    /// <summary>
+    /// Gets the Transform component of the GameObject this Component is attached to.
+    /// </summary>
+    public Transform Transform => _go.Transform;
+
+    /// <summary>
+    /// Gets whether the Start method has been called.
+    /// </summary>
+    public bool HasStarted { get => _hasStarted; internal set => _hasStarted = value; }
+
+    /// <summary>
+    /// Gets whether OnEnable has ever been called on this component.
+    /// Used to determine if OnDispose should be called during cleanup.
+    /// </summary>
+    public bool HasBeenEnabled { get => _hasBeenEnabled; internal set => _hasBeenEnabled = value; }
+
+    /// <summary>
+    /// Gets the tag of the GameObject this Component is attached to.
+    /// </summary>
+    public string Tag => _go.Tag;
+
+    /// <summary>
+    /// Gets or sets whether the Component is enabled.
+    /// </summary>
+    public bool Enabled
+    {
+        get { return _enabled; }
+        set
+        {
+            if (value != _enabled)
+            {
+                MainThreadContext.AssertOwner(_go, nameof(Enabled));
+                _enabled = value;
+                HierarchyStateChanged();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Gets whether the Component is enabled in the hierarchy (considering parent objects).
+    /// </summary>
+    public bool EnabledInHierarchy => _enabledInHierarchy;
+
+    /// <summary>
+    /// The parent <see cref="Prowl.Runtime.Resources.Scene"/> to which this <see cref="Prowl.Runtime.Component"/> belongs.
+    ///
+    /// Note that this property is derived from the components <see cref="GameObject"/>, as a
+    /// <see cref="Prowl.Runtime.Component"/> itself cannot be part of a <see cref="Prowl.Runtime.Resources.Scene"/> without a
+    /// <see cref="GameObject"/>.
+    /// </summary>
+    public Scene? Scene
+    {
+        get
+        {
+            if (GameObject.IsNotValid()) return null;
+            Scene? scene = GameObject.Scene;
+            return scene.IsValid() ? scene : null;
+        }
+    }
+
+    public Component() : base() { }
+
+    /// <summary>
+    /// Compares the tag of the GameObject this Component is attached to with the specified tag.
+    /// </summary>
+    /// <param name="otherTag">The tag to compare against.</param>
+    /// <returns>True if the tags match, false otherwise.</returns>
+    public bool CompareTag(string otherTag) => _go.CompareTag(otherTag);
+
+    #region Component API
+    // Convenience component-access API mirrored onto the behaviour; it's generally recommended to use the GameObject instead
+    /// <inheritdoc cref="GameObject.AddComponent{T}"/>"
+    public T AddComponent<T>() where T : Component, new() => (T)AddComponent(typeof(T));
+    /// <inheritdoc cref="GameObject.AddComponent(Type)"/>"
+    public Component AddComponent([DynamicallyAccessedMembers(DynamicallyAccessedMemberTypes.PublicParameterlessConstructor)] Type type) => GameObject.AddComponent(type);
+    /// <inheritdoc cref="GameObject.RemoveComponent{T}"/>"
+    public void RemoveComponent<T>(T component) where T : Component => GameObject.RemoveComponent(component);
+    /// <inheritdoc cref="GameObject.RemoveComponent(Component)"/>"
+    public void RemoveComponent(Component component) => GameObject.RemoveComponent(component);
+    /// <inheritdoc cref="GameObject.RemoveComponent(Component)"/>"
+    public void RemoveSelf() => GameObject.RemoveComponent(this);
+    /// <inheritdoc cref="GameObject.GetComponent{T}"/>"
+    public T? GetComponent<T>() where T : Component => GameObject.GetComponent<T>();
+    /// <inheritdoc cref="GameObject.GetComponent(Type)"/>"
+    public Component? GetComponent(Type type) => GameObject.GetComponent(type);
+    /// <inheritdoc cref="GameObject.GetComponentByIdentifier(Guid)"/>"
+    public Component? GetComponentByIdentifier(Guid identifier) => GameObject.GetComponentByIdentifier(identifier);
+    /// <inheritdoc cref="GameObject.TryGetComponent{T}(out T)"/>"
+    public bool TryGetComponent<T>(out T component) where T : Component => (component = GetComponent<T>()).IsValid();
+    /// <inheritdoc cref="GameObject.GetComponents{T}"/>"
+    public IEnumerable<T> GetComponents<T>() where T : Component => GameObject.GetComponents<T>();
+    /// <inheritdoc cref="GameObject.GetComponents(Type)"/>"
+    public IEnumerable<Component> GetComponents(Type type) => GameObject.GetComponents(type);
+    /// <inheritdoc cref="GameObject.GetComponentInParent{T}"/>"
+    public T? GetComponentInParent<T>(bool includeSelf = true) where T : Component => GameObject.GetComponentInParent<T>(includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentInParent(Type, bool, bool)"/>"
+    public Component? GetComponentInParent(Type componentType, bool includeSelf = true) => GameObject.GetComponentInParent(componentType, includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentsInParent{T}"/>"
+    public IEnumerable<T> GetComponentsInParent<T>(bool includeSelf = true) where T : Component => GameObject.GetComponentsInParent<T>(includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentsInParent(Type, bool, bool)"/>"
+    public IEnumerable<Component> GetComponentsInParent(Type type, bool includeSelf = true) => GameObject.GetComponentsInParent(type, includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentInChildren{T}"/>"
+    public T? GetComponentInChildren<T>(bool includeSelf = true) where T : Component => GameObject.GetComponentInChildren<T>(includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentInChildren(Type, bool, bool)"/>"
+    public Component? GetComponentInChildren(Type componentType, bool includeSelf = true) => GameObject.GetComponentInChildren(componentType, includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentsInChildren{T}"/>"
+    public IEnumerable<T> GetComponentsInChildren<T>(bool includeSelf = true) where T : Component => GameObject.GetComponentsInChildren<T>(includeSelf);
+    /// <inheritdoc cref="GameObject.GetComponentsInChildren(Type, bool, bool)"/>"
+    public IEnumerable<Component> GetComponentsInChildren(Type type, bool includeSelf = true) => GameObject.GetComponentsInChildren(type, includeSelf);
+
+
+    /// <summary>
+    /// Gets the index of this Component in its GameObject's Component list.
+    /// </summary>
+    /// <returns>The index of this Component in its GameObject's Component list, or null if it has no GameObject.</returns>
+    /// <exception cref="Exception">Thrown if the Component is not found in its GameObject's Component list.</exception>
+    public int? GetSiblingIndex()
+    {
+        if (GameObject.IsNotValid()) return null;
+
+        for (int i = 0; i < GameObject._components.Count; i++)
+            if (object.ReferenceEquals(GameObject._components[i], this))
+                return i;
+
+        throw new Exception($"This Component appears to be in Limbo, This should never happen!, The Component believes its a child of {GameObject.Name} but they don't have it as an attached component!");
+    }
+
+    /// <summary>
+    /// Sets the index of this Component in its GameObject's Component list.
+    /// </summary>
+    /// <param name="index">The new index of this Component.</param>
+    public void SetSiblingIndex(int index)
+    {
+        if (GameObject.IsNotValid()) return;
+
+        // Remove this object from current position
+        GameObject._components.Remove(this);
+
+        // Ensure index is within bounds
+        index = Maths.Max(0, Maths.Min(index, GameObject._components.Count));
+
+        // Insert at new position
+        GameObject._components.Insert(index, this);
+    }
+    #endregion
+
+    /// <summary>
+    /// Attaches this Component to the specified GameObject.
+    /// </summary>
+    /// <param name="go">The GameObject to attach to.</param>
+    internal void AttachToGameObject(GameObject go)
+    {
+        _go = go;
+
+        bool isEnabled = _enabled && _go.EnabledInHierarchy;
+        _enabledInHierarchy = isEnabled;
+    }
+
+    /// <summary>
+    /// Marks this component as no longer part of its GameObject. Disposal waits for the end of the
+    /// frame, so without this a removed component keeps ticking off the already-built dispatch list
+    /// while nothing can find it on the GameObject any more.
+    /// </summary>
+    internal void DetachFromGameObject() => _enabledInHierarchy = false;
+
+    /// <summary>
+    /// Updates the enabled state based on changes in the hierarchy.
+    /// OnEnable/OnDisable are only called if the GameObject is in an active Scene.
+    /// </summary>
+    internal void HierarchyStateChanged()
+    {
+        // A component can be toggled before it is ever attached, and stays attached to a GameObject
+        // that has been disposed. Neither has a hierarchy to be enabled in.
+        bool newState = _enabled && _go.IsValid() && _go.EnabledInHierarchy;
+        if (newState != _enabledInHierarchy)
+        {
+            _enabledInHierarchy = newState;
+
+            // Only call OnEnable/OnDisable if we're in an active Scene
+            Scene? scene = _go.IsValid() ? _go.Scene : null;
+            if (scene.IsValid() && scene.IsActive)
+            {
+                if (newState)
+                    InternalOnEnable();
+                else
+                    InternalOnDisable();
+            }
+        }
+    }
+
+    /// <summary>
+    /// Checks if this Component can be destroyed.
+    /// </summary>
+    /// <returns>True if the Component can be destroyed, false otherwise.</returns>
+    internal bool CanDestroy()
+    {
+        // Skip dependency check if the entire GameObject is being disposed
+        if (_go.IsDisposed)
+            return true;
+
+        if (_go.IsComponentRequired(this, out Type dependentType))
+        {
+            Debug.LogError("Can't remove " + GetType().Name + " because " + dependentType.Name + " depends on it");
+            return false;
+        }
+        return true;
+    }
+
+    #region Behaviour
+
+    // Lifecycle methods
+
+    /// <summary>
+    /// Called when the GameObject is added to a Scene.
+    /// This happens before OnEnable and only once per scene add.
+    /// </summary>
+    public virtual void OnAddedToScene() { }
+
+    /// <summary>
+    /// Called when the GameObject is removed from a Scene.
+    /// This happens after OnDisable and only once per scene remove.
+    /// </summary>
+    public virtual void OnRemovedFromScene() { }
+
+    /// <summary>
+    /// Called when the object becomes enabled and active.
+    /// Only called when the GameObject is in a Scene and enabled.
+    /// </summary>
+    public virtual void OnEnable() { }
+
+    /// <summary>
+    /// Called when the object becomes disabled or inactive.
+    /// Only called when the GameObject was in a Scene and becomes disabled.
+    /// </summary>
+    public virtual void OnDisable() { }
+
+    /// <summary>
+    /// The object is moving to another scene without leaving the world, as <see cref="Scene.DontDestroyOnLoad"/> does,
+    /// so nothing is disabled. Anything registered with the old scene moves in <see cref="JoinScene"/>.
+    /// </summary>
+    internal virtual void LeaveScene(Scene? scene) { }
+
+    /// <summary>The other half of <see cref="LeaveScene"/>, called while the component is enabled in the new scene.</summary>
+    internal virtual void JoinScene(Scene? scene) { }
+
+    /// <summary>
+    /// Called before the first frame update.
+    /// </summary>
+    public virtual void Start() { }
+
+    /// <summary>
+    /// Called at fixed time intervals.
+    /// </summary>
+    public virtual void FixedUpdate() { }
+
+    /// <summary>
+    /// Called every frame.
+    /// </summary>
+    public virtual void Update() { }
+
+    /// <summary>
+    /// Called every frame after all Update functions have been called.
+    /// </summary>
+    public virtual void LateUpdate() { }
+
+    /// <summary>
+    /// Called for rendering and handling GUI gizmos.
+    /// </summary>
+    public virtual void DrawGizmos() { }
+
+    /// <summary>
+    /// Called for rendering and handling GUI gizmos.
+    /// </summary>
+    public virtual void DrawGizmosSelected() { }
+
+    /// <summary>
+    /// Called for drawing and handling interaction with Runtime/Ingame UI
+    /// </summary>
+    /// <param name="paper"></param>
+    public virtual void OnGui(Paper paper) { }
+
+    /// <summary>
+    /// Called after the physics step in which a collider on this GameObject, or one owned by its
+    /// <see cref="Rigidbody3D"/>, begins touching another collider. Both sides receive it.
+    /// </summary>
+    public virtual void OnCollisionBegin(Collision collision) { }
+
+    /// <summary>Called after every physics step the contact persists, following <see cref="OnCollisionBegin"/>.</summary>
+    public virtual void OnCollisionStay(Collision collision) { }
+
+    /// <summary>Called after the physics step in which the contact ended, or when either side left the world.</summary>
+    public virtual void OnCollisionEnd(Collision collision) { }
+
+    /// <summary>Called once when <paramref name="other"/> first enters a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnTriggerEnter(Rigidbody3D other) { }
+
+    /// <summary>Called each fixed step while <paramref name="other"/> stays inside a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnTriggerStay(Rigidbody3D other) { }
+
+    /// <summary>Called once when <paramref name="other"/> leaves a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnTriggerExit(Rigidbody3D other) { }
+
+    /// <summary>Called once when <paramref name="character"/> first enters a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnCharacterEnter(CharacterController character) { }
+
+    /// <summary>Called each fixed step while <paramref name="character"/> stays inside a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnCharacterStay(CharacterController character) { }
+
+    /// <summary>Called once when <paramref name="character"/> leaves a <see cref="TriggerVolume"/> on this GameObject.</summary>
+    public virtual void OnCharacterExit(CharacterController character) { }
+
+    /// <summary>Gated Start only runs in play mode or with [ExecuteAlways].</summary>
+    internal void InternalStart()
+    {
+        if (HasStarted) return;
+        if (!RunsGameplay) return;
+        HasStarted = true;
+        try { Start(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] Start() threw", ex); }
+    }
+
+    /// <summary>Gated Update only runs in play mode or with [ExecuteAlways].</summary>
+    internal void InternalUpdate()
+    {
+        if (!RunsGameplay) return;
+        try { Update(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] Update() threw", ex); }
+    }
+
+    /// <summary>Gated LateUpdate only runs in play mode or with [ExecuteAlways].</summary>
+    internal void InternalLateUpdate()
+    {
+        if (!RunsGameplay) return;
+        try { LateUpdate(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] LateUpdate() threw", ex); }
+    }
+
+    /// <summary>Gated FixedUpdate only runs in play mode or with [ExecuteAlways].</summary>
+    internal void InternalFixedUpdate()
+    {
+        if (!RunsGameplay) return;
+        try { FixedUpdate(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] FixedUpdate() threw", ex); }
+    }
+
+    /// <summary>Gated OnEnable only runs in play mode or with [ExecuteAlways].</summary>
+    internal void InternalOnEnable()
+    {
+        _hasBeenEnabled = true;
+        // Register for ticking whenever enabled in an active scene, regardless of play mode; the
+        // per-tick gate (ShouldExecuteGameplay) decides whether the callbacks actually run.
+        if (GameObject.IsValid())
+        {
+            Scene? scene = GameObject.Scene;
+            if (scene.IsValid())
+            {
+                scene.Dispatcher.Register(this);
+                if (this is Rendering.IRenderSync render) scene.Rendering.Add(render);
+            }
+        }
+        if (!ShouldExecuteGameplay) return;
+        _gameplayEnabled = true;
+        try { OnEnable(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnEnable() threw", ex); }
+    }
+
+    /// <summary>OnDisable only runs to pair with a gameplay OnEnable.</summary>
+    internal void InternalOnDisable()
+    {
+        // Reference check rather than validity: this also runs while the GameObject is being disposed,
+        // when it already reads as invalid but its scene link is still intact. Leaving must always work.
+        if (GameObject is not null)
+        {
+            Scene? scene = GameObject.Scene;
+            if (scene.IsValid())
+            {
+                scene.Dispatcher.Unregister(this);
+                if (this is Rendering.IRenderSync render) scene.Rendering.Remove(render);
+            }
+        }
+        if (!_gameplayEnabled) return;
+        _gameplayEnabled = false;
+        try { OnDisable(); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnDisable() threw", ex); }
+    }
+
+    // ---- Physics callbacks: gameplay-gated + exception-guarded, dispatched by SceneDispatcher ----
+
+    internal void InternalOnCollisionBegin(in Collision collision)
+    {
+        if (!RunsGameplay) return;
+        try { OnCollisionBegin(collision); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCollisionBegin() threw", ex); }
+    }
+
+    internal void InternalOnCollisionStay(in Collision collision)
+    {
+        if (!RunsGameplay) return;
+        try { OnCollisionStay(collision); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCollisionStay() threw", ex); }
+    }
+
+    internal void InternalOnCollisionEnd(in Collision collision)
+    {
+        if (!RunsGameplay) return;
+        try { OnCollisionEnd(collision); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCollisionEnd() threw", ex); }
+    }
+
+    internal void InternalOnTriggerEnter(Rigidbody3D other)
+    {
+        if (!RunsGameplay) return;
+        try { OnTriggerEnter(other); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnTriggerEnter() threw", ex); }
+    }
+
+    internal void InternalOnTriggerStay(Rigidbody3D other)
+    {
+        if (!RunsGameplay) return;
+        try { OnTriggerStay(other); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnTriggerStay() threw", ex); }
+    }
+
+    internal void InternalOnTriggerExit(Rigidbody3D other)
+    {
+        if (!RunsGameplay) return;
+        try { OnTriggerExit(other); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnTriggerExit() threw", ex); }
+    }
+
+    internal void InternalOnCharacterEnter(CharacterController character)
+    {
+        if (!RunsGameplay) return;
+        try { OnCharacterEnter(character); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCharacterEnter() threw", ex); }
+    }
+
+    internal void InternalOnCharacterStay(CharacterController character)
+    {
+        if (!RunsGameplay) return;
+        try { OnCharacterStay(character); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCharacterStay() threw", ex); }
+    }
+
+    internal void InternalOnCharacterExit(CharacterController character)
+    {
+        if (!RunsGameplay) return;
+        try { OnCharacterExit(character); }
+        catch (Exception ex) { Debug.LogException($"[{Name}/{GetType().Name}] OnCharacterExit() threw", ex); }
+    }
+
+    // Implemented explicitly so the identity rules below always run. They used to live in the virtual
+    // OnAfterDeserialize, where a component that overrode it without calling base kept the identifier
+    // stored in the data - and every instance of that prefab then shared one identifier, so anything
+    // resolving a component by id found whichever instance came first.
+    void ISerializationCallbackReceiver.OnBeforeSerialize() => OnBeforeSerialize();
+
+    void ISerializationCallbackReceiver.OnAfterDeserialize()
+    {
+        // A fresh identity every time: a copy of a component must not come back wearing the
+        // original's identifier. Which source component this came from is recorded on the owning
+        // GameObject's prefab link instead.
+        _loadedIdentifier = _identifier;
+        if (!GameObject.PreservingIdentifiers)
+            _identifier = Guid.NewGuid();
+
+        OnAfterDeserialize();
+    }
+
+    /// <summary>Called right before this component is serialized. Override to refresh serialized
+    /// fields from live state.</summary>
+    public virtual void OnBeforeSerialize() { }
+
+    /// <summary>Called right after this component is deserialized, before any lifecycle callback.
+    /// Override to react to freshly loaded values.</summary>
+    public virtual void OnAfterDeserialize() { }
+
+    private protected override void AssertCanDispose() => MainThreadContext.AssertOwner(_go, nameof(Dispose));
+
+    /// <summary>Throws when this component's live object is touched from a thread other than the main one.</summary>
+    private protected void AssertOwner([System.Runtime.CompilerServices.CallerMemberName] string member = "")
+        => MainThreadContext.AssertOwner(_go, member);
+
+    private protected override void OnDisposed()
+    {
+        CancellationTokenSource? cancellation = Interlocked.Exchange(ref _destroyCancellation, null);
+        if (cancellation == null) return;
+
+        try { cancellation.Cancel(); }
+        catch (AggregateException e) { Debug.LogError($"[{Name}/{GetType().Name}] A DestroyCancellationToken callback threw: {e.InnerException?.Message}\n{e.InnerException?.StackTrace}"); }
+    }
+
+    /// <summary>
+    /// Called when the Component will be destroyed.
+    /// This is an override of EngineObject.OnDispose() and is also exposed as a virtual lifecycle method.
+    /// </summary>
+    protected override void OnDispose()
+    {
+        // Teardown, not an edit, so it goes through regardless of whether a prefab provided this.
+        if (GameObject.IsValid())
+            GameObject.RemoveComponentInternal(this);
+    }
+
+    #endregion
+}

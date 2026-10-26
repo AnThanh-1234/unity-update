@@ -1,0 +1,583 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+
+using Prowl.Ember;
+using Prowl.PaperUI;
+using Prowl.Runtime.Rendering;
+
+namespace Prowl.Runtime;
+
+/// <summary>
+/// Which optional <see cref="Component"/> callbacks a component actually overrides. Resolved once per
+/// instance and cached on it, so neither the per-frame loops nor the physics events pay a type lookup.
+/// </summary>
+[Flags]
+internal enum SceneCallbacks
+{
+    None = 0,
+
+    Start = 1 << 0,
+    Update = 1 << 1,
+    LateUpdate = 1 << 2,
+    FixedUpdate = 1 << 3,
+    RenderCollect = 1 << 4,
+    DrawGizmos = 1 << 5,
+    OnGui = 1 << 6,
+
+    CollisionBegin = 1 << 7,
+    CollisionEnd = 1 << 8,
+    TriggerEnter = 1 << 9,
+    TriggerStay = 1 << 10,
+    TriggerExit = 1 << 11,
+    CollisionStay = 1 << 12,
+    CharacterEnter = 1 << 13,
+    CharacterStay = 1 << 14,
+    CharacterExit = 1 << 15,
+
+    AnyCollision = CollisionBegin | CollisionStay | CollisionEnd,
+
+    /// <summary>Everything the per-frame loops dispatch. A component with none of these is never registered.</summary>
+    AnyFrame = Start | Update | LateUpdate | FixedUpdate | RenderCollect | DrawGizmos | OnGui,
+
+    /// <summary>
+    /// Set once this instance's set has been worked out. The unresolved state is deliberately the default
+    /// value rather than a sentinel: a component's fields can arrive zeroed after a hot reload without the
+    /// engine assembly's IL being available to replay an initializer, and a sentinel that depended on that
+    /// would silently decay into "overrides nothing".
+    /// </summary>
+    Resolved = 1 << 30,
+}
+
+/// <summary>
+/// The scene's single dispatch point for component callbacks: the per-frame loops (Start, Update, LateUpdate,
+/// FixedUpdate, DrawGizmos, OnGui) and the sparse physics events (collision and trigger).
+/// Both used to be separate types doing the same job at different granularities, and the physics half paid a
+/// type lookup per component per event, which is the wrong cost to carry on a contact callback.
+/// </summary>
+/// <remarks>
+/// Three things keep this cheap. A component's callback set is resolved once and cached on the instance, so a
+/// dispatch test is a field read and a mask AND rather than a dictionary probe. Registration is a dense array
+/// with swap-back removal, so enabling or destroying a component is constant time instead of a scan per
+/// channel. And a channel's execution-ordered array is rebuilt at most once per frame no matter how many
+/// components joined or left, rather than re-sorted on every membership change.
+///
+/// Across a hot reload the walk migrates the component references in place, then <see cref="Reset"/> drops
+/// every derived answer so membership and ordering are re-derived from the new types: a component that newly
+/// overrides a callback starts dispatching, and one that dropped it stops.
+/// </remarks>
+internal sealed class SceneDispatcher
+{
+    // ---- per-instance callback resolution ------------------------------------------------------------
+
+    // Which callbacks a concrete component type overrides. One entry per type, cleared on hot reload.
+    private static readonly ReloadCache<Type, SceneCallbacks> s_byType = new(Compute);
+
+    private static SceneCallbacks Compute(Type type)
+    {
+        SceneCallbacks callbacks = SceneCallbacks.None;
+
+        if (Overrides(type, nameof(Component.Start))) callbacks |= SceneCallbacks.Start;
+        if (Overrides(type, nameof(Component.Update))) callbacks |= SceneCallbacks.Update;
+        if (Overrides(type, nameof(Component.LateUpdate))) callbacks |= SceneCallbacks.LateUpdate;
+        if (Overrides(type, nameof(Component.FixedUpdate))) callbacks |= SceneCallbacks.FixedUpdate;
+        if (Overrides(type, nameof(Component.DrawGizmos))) callbacks |= SceneCallbacks.DrawGizmos;
+        if (Overrides(type, nameof(Component.OnGui))) callbacks |= SceneCallbacks.OnGui;
+
+        if (Overrides(type, nameof(Component.OnCollisionBegin))) callbacks |= SceneCallbacks.CollisionBegin;
+        if (Overrides(type, nameof(Component.OnCollisionStay))) callbacks |= SceneCallbacks.CollisionStay;
+        if (Overrides(type, nameof(Component.OnCollisionEnd))) callbacks |= SceneCallbacks.CollisionEnd;
+        if (Overrides(type, nameof(Component.OnTriggerEnter))) callbacks |= SceneCallbacks.TriggerEnter;
+        if (Overrides(type, nameof(Component.OnTriggerStay))) callbacks |= SceneCallbacks.TriggerStay;
+        if (Overrides(type, nameof(Component.OnTriggerExit))) callbacks |= SceneCallbacks.TriggerExit;
+        if (Overrides(type, nameof(Component.OnCharacterEnter))) callbacks |= SceneCallbacks.CharacterEnter;
+        if (Overrides(type, nameof(Component.OnCharacterStay))) callbacks |= SceneCallbacks.CharacterStay;
+        if (Overrides(type, nameof(Component.OnCharacterExit))) callbacks |= SceneCallbacks.CharacterExit;
+
+        return callbacks;
+    }
+
+    [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Component subclasses are user or engine types the application's trim configuration must preserve.")]
+    private static bool Overrides(Type type, string method)
+        => RuntimeUtils.OverridesVirtual(type, method, typeof(Component));
+
+    /// <summary>
+    /// The component's callback set, resolved from its type the first time it is asked for and cached on the
+    /// instance. The cache field is opted out of hot reload, so a replaced instance arrives unresolved and
+    /// picks up whatever its new type overrides.
+    /// </summary>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal static SceneCallbacks CallbacksOf(Component c)
+    {
+        SceneCallbacks cached = c._callbacks;
+        return (cached & SceneCallbacks.Resolved) != 0 ? cached : Resolve(c);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static SceneCallbacks Resolve(Component c)
+        => c._callbacks = s_byType[c.GetType()] | SceneCallbacks.Resolved;
+
+    // ---- registration --------------------------------------------------------------------------------
+
+    /// <summary>Enabled components that listen for a collision event. Physics tracks no contacts while there are none.</summary>
+    public int CollisionListeners { get; private set; }
+
+    private Component[] _registered = new Component[64];
+    private int _count;
+    private int _sequence;
+
+    private readonly Channel _start = new(SceneCallbacks.Start);
+    private readonly Channel _update = new(SceneCallbacks.Update);
+    private readonly Channel _lateUpdate = new(SceneCallbacks.LateUpdate);
+    private readonly Channel _fixedUpdate = new(SceneCallbacks.FixedUpdate);
+    private readonly Channel _drawGizmos = new(SceneCallbacks.DrawGizmos);
+    private readonly Channel _onGui = new(SceneCallbacks.OnGui);
+
+    /// <summary>
+    /// Starts dispatching a component's per-frame callbacks. Called whenever it becomes enabled in an active
+    /// scene; the per-tick gameplay gate decides whether they actually run.
+    /// </summary>
+    [UnconditionalSuppressMessage("Trimming", "IL2026:RequiresUnreferencedCode",
+        Justification = "Component subclasses are user or engine types the application's trim configuration must preserve.")]
+    public void Register(Component c)
+    {
+        SceneCallbacks callbacks = CallbacksOf(c);
+        if ((callbacks & SceneCallbacks.AnyCollision) != 0 && !c._countedCollisionListener)
+        {
+            c._countedCollisionListener = true;
+            CollisionListeners++;
+        }
+
+        if (c._dispatchSlot != 0) return;
+
+        // A component with no per-frame callback is never in the arrays at all, so it costs nothing to have
+        // and never lengthens a channel rebuild. Its physics callbacks still dispatch, from the mask alone.
+        if ((callbacks & SceneCallbacks.AnyFrame) == 0) return;
+
+        if (_count == _registered.Length)
+            Array.Resize(ref _registered, _registered.Length * 2);
+
+        c._dispatchOrder = RuntimeUtils.GetExecutionOrder(c);
+        c._dispatchSequence = ++_sequence;
+        c._dispatchSlot = _count + 1;
+        _registered[_count++] = c;
+
+        MarkDirty(callbacks);
+    }
+
+    /// <summary>Stops dispatching a component's per-frame callbacks. Constant time.</summary>
+    public void Unregister(Component c)
+    {
+        if (c._countedCollisionListener)
+        {
+            c._countedCollisionListener = false;
+            CollisionListeners--;
+        }
+
+        int slot = c._dispatchSlot;
+        if (slot == 0) return;
+
+        // Swap the tail into the hole. Ordering is carried by the sequence number, not by array position,
+        // so moving an entry cannot change dispatch order.
+        int index = slot - 1;
+        int last = --_count;
+        Component moved = _registered[last];
+        _registered[index] = moved;
+        moved._dispatchSlot = index + 1;
+        _registered[last] = null!;
+
+        c._dispatchSlot = 0;
+        MarkDirty(CallbacksOf(c));
+    }
+
+    /// <summary>
+    /// Drops every derived answer: registration, channel membership, and each component's cached callback set
+    /// and ordering. The caller re-registers from the live scene afterwards.
+    /// </summary>
+    public void Reset()
+    {
+        for (int i = 0; i < _count; i++)
+        {
+            Component c = _registered[i];
+            if (c is null) continue;
+
+            c._dispatchSlot = 0;
+            c._callbacks = default; // unresolved, so the new type decides membership
+            _registered[i] = null!;
+        }
+
+        _count = 0;
+        _sequence = 0;
+        CollisionListeners = 0;
+
+        _start.Clear(); _update.Clear(); _lateUpdate.Clear(); _fixedUpdate.Clear();
+        _drawGizmos.Clear(); _onGui.Clear();
+    }
+
+    private void MarkDirty(SceneCallbacks callbacks)
+    {
+        if ((callbacks & SceneCallbacks.Start) != 0) _start.Dirty = true;
+        if ((callbacks & SceneCallbacks.Update) != 0) _update.Dirty = true;
+        if ((callbacks & SceneCallbacks.LateUpdate) != 0) _lateUpdate.Dirty = true;
+        if ((callbacks & SceneCallbacks.FixedUpdate) != 0) _fixedUpdate.Dirty = true;
+        if ((callbacks & SceneCallbacks.DrawGizmos) != 0) _drawGizmos.Dirty = true;
+        if ((callbacks & SceneCallbacks.OnGui) != 0) _onGui.Dirty = true;
+    }
+
+    // ---- one callback's execution-ordered membership -------------------------------------------------
+
+    /// <summary>
+    /// The components subscribed to one callback, in execution order. Rebuilt lazily, so a frame that enables
+    /// a thousand components pays one rebuild rather than a thousand re-sorts, and iterating the rebuilt array
+    /// keeps a loop safe against a callback enabling or disabling something mid-dispatch.
+    /// </summary>
+    private sealed class Channel
+    {
+        private readonly SceneCallbacks _bit;
+        private Component[] _items = Array.Empty<Component>();
+        private int _count;
+
+        public Channel(SceneCallbacks bit) => _bit = bit;
+
+        public bool Dirty = true;
+
+        public void Clear()
+        {
+            Array.Clear(_items, 0, _count);
+            _count = 0;
+            Dirty = true;
+        }
+
+        public int Snapshot(SceneDispatcher owner, out Component[] items)
+        {
+            if (Dirty) Rebuild(owner);
+            items = _items;
+            return _count;
+        }
+
+        private void Rebuild(SceneDispatcher owner)
+        {
+            Component[] source = owner._registered;
+            int sourceCount = owner._count;
+
+            if (_items.Length < sourceCount)
+                _items = new Component[Math.Max(sourceCount, 8)];
+
+            int n = 0;
+            bool skipStarted = _bit == SceneCallbacks.Start;
+
+            for (int i = 0; i < sourceCount; i++)
+            {
+                Component c = source[i];
+                if ((c._callbacks & _bit) == 0) continue;
+
+                // A component only ever starts once, so it leaves this channel for good afterwards.
+                if (skipStarted && c.HasStarted) continue;
+
+                _items[n++] = c;
+            }
+
+            Array.Clear(_items, n, _items.Length - n);
+            _count = n;
+
+            if (n > 1) Array.Sort(_items, 0, n, DispatchOrder.Instance);
+            Dirty = false;
+        }
+    }
+
+    /// <summary>
+    /// Execution order first, then registration order. Comparing two cached ints keeps the sort off the
+    /// reflection path entirely, and the sequence tie-break makes the result independent of array position,
+    /// which is what lets registration use swap-back removal.
+    /// </summary>
+    private sealed class DispatchOrder : IComparer<Component>
+    {
+        public static readonly DispatchOrder Instance = new();
+
+        public int Compare(Component? a, Component? b)
+        {
+            int order = a!._dispatchOrder.CompareTo(b!._dispatchOrder);
+            return order != 0 ? order : a._dispatchSequence.CompareTo(b._dispatchSequence);
+        }
+    }
+
+    // ---- per-frame gameplay callbacks ----------------------------------------------------------------
+
+    public void RunStart()
+    {
+        int count = _start.Snapshot(this, out Component[] items);
+        bool anyStarted = false;
+
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            if (c.IsDisposed || c.HasStarted || !c.EnabledInHierarchy) continue;
+
+            try { c.InternalStart(); }
+            catch (Exception ex) { Report(c, nameof(Component.Start), ex); }
+
+            anyStarted |= c.HasStarted;
+        }
+
+        // Started components drop out on the next rebuild. Removing them one at a time here is what made
+        // bringing a scene up quadratic.
+        if (anyStarted) _start.Dirty = true;
+    }
+
+    public void RunUpdate()
+    {
+        int count = _update.Snapshot(this, out Component[] items);
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            if (c.IsDisposed || !c.EnabledInHierarchy) continue;
+
+            try { c.InternalUpdate(); }
+            catch (Exception ex) { Report(c, nameof(Component.Update), ex); }
+        }
+    }
+
+    public void RunLateUpdate()
+    {
+        int count = _lateUpdate.Snapshot(this, out Component[] items);
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            if (c.IsDisposed || !c.EnabledInHierarchy) continue;
+
+            try { c.InternalLateUpdate(); }
+            catch (Exception ex) { Report(c, nameof(Component.LateUpdate), ex); }
+        }
+    }
+
+    public void RunFixedUpdate()
+    {
+        int count = _fixedUpdate.Snapshot(this, out Component[] items);
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            if (c.IsDisposed || !c.EnabledInHierarchy) continue;
+
+            try { c.InternalFixedUpdate(); }
+            catch (Exception ex) { Report(c, nameof(Component.FixedUpdate), ex); }
+        }
+    }
+
+    // ---- rendering and gizmo callbacks (run in edit mode too, so not gameplay gated) -----------------
+
+    public void RunDrawGizmos()
+    {
+        int count = _drawGizmos.Snapshot(this, out Component[] items);
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            if (c.IsDisposed || !c.EnabledInHierarchy || (c.HideFlags & HideFlags.NoGizmos) != 0) continue;
+
+            try { c.DrawGizmos(); }
+            catch (Exception ex) { Report(c, nameof(Component.DrawGizmos), ex); }
+        }
+    }
+
+    public void RunOnGui(Paper paper)
+    {
+        int count = _onGui.Snapshot(this, out Component[] items);
+        for (int i = 0; i < count; i++)
+        {
+            Component c = items[i];
+            // Gated like Update, so a component whose OnEnable never ran (the edit scene in the frame play
+            // mode starts) is skipped
+            if (c.IsDisposed || !c.EnabledInHierarchy || !c.RunsGameplay) continue;
+
+            try { c.OnGui(paper); }
+            catch (Exception ex) { Report(c, nameof(Component.OnGui), ex); }
+        }
+    }
+
+    private static void Report(Component c, string callback, Exception ex)
+        => Debug.LogError($"[{(c.GameObject.IsValid() ? c.GameObject.Name : null)}/{c.GetType().Name}] {callback} threw: {ex.Message}\n{ex.StackTrace}");
+
+    // ---- sparse physics events -----------------------------------------------------------------------
+    //
+    // These fire per contact, so the whole point is to get out cheaply. Recipients are resolved from the
+    // GameObject's live component list rather than stored as delegates, which is also what lets them survive
+    // a hot reload for free: the list is repointed to the migrated instances and the masks are re-resolved.
+
+    public static void CollisionBegin(GameObject go, in Collision collision)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CollisionBegin, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCollisionBegin(collision); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCollisionBegin(collision); }
+        finally { Release(many!, count); }
+    }
+
+    public static void CollisionStay(GameObject go, in Collision collision)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CollisionStay, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCollisionStay(collision); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCollisionStay(collision); }
+        finally { Release(many!, count); }
+    }
+
+    /// <summary>Whether any live component on the GameObject listens for the callback.</summary>
+    public static bool HasRecipient(GameObject go, SceneCallbacks which)
+    {
+        if (go is null) return false;
+
+        List<Component> components = go._components;
+        for (int i = 0; i < components.Count; i++)
+        {
+            Component c = components[i];
+            if ((CallbacksOf(c) & which) != 0 && !c.IsDisposed && c.EnabledInHierarchy) return true;
+        }
+
+        return false;
+    }
+
+    public static void CollisionEnd(GameObject go, in Collision collision)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CollisionEnd, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCollisionEnd(collision); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCollisionEnd(collision); }
+        finally { Release(many!, count); }
+    }
+
+    public static void TriggerEnter(GameObject go, Rigidbody3D other)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.TriggerEnter, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnTriggerEnter(other); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnTriggerEnter(other); }
+        finally { Release(many!, count); }
+    }
+
+    public static void TriggerStay(GameObject go, Rigidbody3D other)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.TriggerStay, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnTriggerStay(other); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnTriggerStay(other); }
+        finally { Release(many!, count); }
+    }
+
+    public static void TriggerExit(GameObject go, Rigidbody3D other)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.TriggerExit, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnTriggerExit(other); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnTriggerExit(other); }
+        finally { Release(many!, count); }
+    }
+
+    public static void CharacterEnter(GameObject go, CharacterController character)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CharacterEnter, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCharacterEnter(character); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCharacterEnter(character); }
+        finally { Release(many!, count); }
+    }
+
+    public static void CharacterStay(GameObject go, CharacterController character)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CharacterStay, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCharacterStay(character); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCharacterStay(character); }
+        finally { Release(many!, count); }
+    }
+
+    public static void CharacterExit(GameObject go, CharacterController character)
+    {
+        if (go is null) return;
+
+        int count = Collect(go, SceneCallbacks.CharacterExit, out Component single, out Component[]? many);
+        if (count == 0) return;
+        if (count == 1) { single.InternalOnCharacterExit(character); return; }
+
+        try { for (int i = 0; i < count; i++) many![i].InternalOnCharacterExit(character); }
+        finally { Release(many!, count); }
+    }
+
+    // A handler may add or remove components, or trigger a nested event, so more than one recipient has to be
+    // dispatched off a snapshot. Nothing is copied for the overwhelmingly common cases of no handler at all
+    // or exactly one, which is where the contact callbacks actually spend their time.
+    private static int Collect(GameObject go, SceneCallbacks which, out Component single, out Component[]? many)
+    {
+        single = null!;
+        many = null;
+
+        List<Component> components = go._components;
+        int total = components.Count;
+        int found = 0;
+
+        for (int i = 0; i < total; i++)
+        {
+            Component c = components[i];
+            if ((CallbacksOf(c) & which) == 0) continue;
+            if (c.IsDisposed || !c.EnabledInHierarchy) continue;
+
+            if (found == 0) single = c;
+            else
+            {
+                many ??= Rent(total);
+                if (found == 1) many[0] = single;
+                many[found] = c;
+            }
+
+            found++;
+        }
+
+        return found;
+    }
+
+    [ThreadStatic] private static Stack<Component[]>? t_buffers;
+
+    private static Component[] Rent(int minimum)
+    {
+        Stack<Component[]> pool = t_buffers ??= new Stack<Component[]>();
+
+        while (pool.TryPop(out Component[]? buffer))
+            if (buffer.Length >= minimum)
+                return buffer;
+
+        return new Component[Math.Max(minimum, 8)];
+    }
+
+    private static void Release(Component[] buffer, int used)
+    {
+        Array.Clear(buffer, 0, used);
+        (t_buffers ??= new Stack<Component[]>()).Push(buffer);
+    }
+}

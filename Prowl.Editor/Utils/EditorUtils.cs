@@ -1,0 +1,128 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Reflection;
+using System.Runtime.InteropServices;
+
+using Prowl.Runtime;
+
+namespace Prowl.Editor.Utils;
+
+public static class EditorUtils
+{
+    public static bool TryParseNonEmptyGuid(string? s, out Guid result)
+    {
+        result = Guid.Empty;
+        return !string.IsNullOrEmpty(s) && Guid.TryParse(s, out result) && result != Guid.Empty;
+    }
+
+    public static bool MatchesSearch(string text, string? search) =>
+        string.IsNullOrEmpty(search) || text.Contains(search, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Turns arbitrary text into something safe to use as a single path segment.
+    /// </summary>
+    /// <remarks>
+    /// Anywhere a name the user typed becomes a folder or a file. Dropping the invalid characters is not
+    /// enough on its own: "." and ".." survive that filter and still walk up a directory, and a name that
+    /// is rooted or carries a separator makes <see cref="Path.Combine"/> return somewhere else entirely
+    /// rather than a child of the folder that was meant.
+    /// </remarks>
+    public static string SafeFileName(string name, string fallback)
+    {
+        string safe = string.Join('_', name.Split(Path.GetInvalidFileNameChars())).Trim();
+        return safe.TrimStart('.').Length == 0 ? fallback : safe;
+    }
+
+    /// <summary>
+    /// Every non framework type. Sourced from the live assembly set rather than the domain, so a hot reload's
+    /// superseded build cannot contribute a second, stale copy of every user type.
+    /// </summary>
+    public static IEnumerable<Type> GetAllTypes()
+    {
+        foreach (Assembly assembly in RuntimeUtils.AssemblySource())
+        {
+            if (IsFrameworkAssembly(assembly)) continue;
+            foreach (Type type in RuntimeUtils.GetLoadableTypes(assembly))
+                yield return type;
+        }
+    }
+
+    public static bool IsFrameworkAssembly(Assembly assembly)
+    {
+        string? name = assembly.GetName().Name;
+        if (string.IsNullOrEmpty(name)) return true;
+        return name.StartsWith("System", StringComparison.Ordinal)
+            || name.StartsWith("Microsoft", StringComparison.Ordinal)
+            || name == "mscorlib" || name == "netstandard" || name == "WindowsBase";
+    }
+
+    public static IEnumerable<MethodInfo> GetAllMethods(BindingFlags flags)
+    {
+        foreach (Type type in GetAllTypes())
+            foreach (MethodInfo method in type.GetMethods(flags))
+                yield return method;
+    }
+
+    public static string GetHierarchyPath(GameObject go)
+    {
+        GameObject? parent = go.Parent;
+        if (!parent.IsValid()) return "";
+        var parts = new List<string>();
+        while (parent.IsValid())
+        {
+            parts.Add(parent.Name);
+            parent = parent.Parent;
+        }
+        parts.Reverse();
+        return string.Join("/", parts);
+    }
+
+    public static void OpenUrl(string url)
+    {
+        try
+        {
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                Process.Start("open", url);
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+                Process.Start("xdg-open", url);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Unable to open link: {ex.Message}");
+        }
+    }
+
+    public static void OpenFileSystemPath(string absPath)
+    {
+        try
+        {
+            // Normalize separators to the platform's native form
+            absPath = Path.GetFullPath(absPath);
+
+            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            {
+                if (Directory.Exists(absPath))
+                    Process.Start("explorer.exe", absPath);
+                else if (File.Exists(absPath))
+                    Process.Start("explorer.exe", $"/select,\"{absPath}\"");
+            }
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
+                Process.Start("open", $"-R \"{absPath}\"");
+            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+            {
+                if (Directory.Exists(absPath))
+                    Process.Start("xdg-open", absPath);
+                else if (File.Exists(absPath))
+                    Process.Start("xdg-open", $"\"{Path.GetDirectoryName(absPath)}\"");
+            }
+        }
+        catch { }
+    }
+}

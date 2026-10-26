@@ -1,0 +1,285 @@
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+using Prowl.Editor.Core;
+using Prowl.OrigamiUI;
+using Prowl.PaperUI;
+using Prowl.Runtime;
+
+namespace Prowl.Editor;
+
+/// <summary> Provides a pinned GameObject context for menu operations, either set explicitly or following the active selection. </summary>
+public static class MenuContext
+{
+    private static GameObject? _pinned;
+    private static bool _isPinned;
+    private static IReadOnlyList<GameObject> _targets = [];
+
+    /// <summary> Every GameObject a row menu was opened over, when more than one is selected; empty otherwise. </summary>
+    public static IReadOnlyList<GameObject> Targets => _targets;
+
+    /// <summary> Returns the explicitly pinned GameObject for context menus, or the first selected GameObject when no pin is active. </summary>
+    public static GameObject? ActiveGameObject => _isPinned
+        ? (_pinned.IsValid() ? _pinned : null)
+        : Selection.GetSelected<GameObject>().FirstOrDefault();
+
+    /// <summary> Pins the context to the specified GameObject. When go is null, the pin is set to null and ActiveGameObject will return null. </summary>
+    public static void Set(GameObject? go)
+    {
+        _pinned = go;
+        _isPinned = true;
+        _targets = [];
+    }
+
+    /// <summary> Pins the context to the first of several GameObjects, remembering all of them for per-target items. </summary>
+    public static void SetMany(IReadOnlyList<GameObject> gos)
+    {
+        Set(gos.Count > 0 ? gos[0] : null);
+        if (gos.Count > 1) _targets = gos;
+    }
+
+    /// <summary> Drops the pin so the context follows the active selection again. </summary>
+    public static void Clear()
+    {
+        _pinned = null;
+        _isPinned = false;
+        _targets = [];
+    }
+}
+
+/// <summary> Attribute applied to methods to register them as menu items. Supports validation methods, priority ordering, icons, and separators. </summary>
+[AttributeUsage(AttributeTargets.Method, AllowMultiple = true)]
+public sealed class MenuItemAttribute : Attribute
+{
+    /// <summary> The menu path for this item, e.g. "GameObject/Create Empty". </summary>
+    public string Path { get; }
+    /// <summary> When true, the attributed method is a validation function that returns whether the menu item should be enabled. </summary>
+    public bool IsValidate { get; }
+    /// <summary> Sort order for this menu item. Lower values appear first. Default is 1000. </summary>
+    public int Priority { get; }
+    /// <summary> Optional icon name to display alongside the menu item. </summary>
+    public string Icon { get; init; } = "";
+    /// <summary> When true, inserts a separator before this menu item. </summary>
+    public bool Separator { get; init; } = false;
+    /// <summary> When true, the item acts on the whole selection itself instead of being run once per multi-selected target. </summary>
+    public bool SelectionWide { get; init; } = false;
+
+    /// <summary> Initializes a new menu item attribute with the specified path, validation flag, and priority. </summary>
+    public MenuItemAttribute(string path, bool isValidate = false, int priority = 1000)
+    {
+        Path = path;
+        IsValidate = isValidate;
+        Priority = priority;
+    }
+
+    private sealed record Entry(string Path, Action Action, int Priority, string Icon, Type DeclaringType, bool Separator = false, bool SelectionWide = false);
+
+    private static readonly List<Entry> _entries = [];
+    private static readonly Dictionary<string, Func<bool>> _validators = new(StringComparer.Ordinal);
+    private static bool _dirty;
+    private static List<Entry>? _sorted;
+
+    internal static void Scan(MethodInfo method)
+    {
+        foreach (MenuItemAttribute attr in method.GetCustomAttributes<MenuItemAttribute>())
+        {
+            if (attr.IsValidate)
+            {
+                if (method.ReturnType != typeof(bool) || method.GetParameters().Length != 0) continue;
+                try { _validators[attr.Path] = (Func<bool>)Delegate.CreateDelegate(typeof(Func<bool>), method); }
+                catch { }
+            }
+            else
+            {
+                if (method.ReturnType != typeof(void) || method.GetParameters().Length != 0) continue;
+                try
+                {
+                    var del = (Action)Delegate.CreateDelegate(typeof(Action), method);
+                    _entries.Add(new Entry(attr.Path, del, attr.Priority, attr.Icon, method.DeclaringType!, attr.Separator, attr.SelectionWide));
+                    _dirty = true;
+                }
+                catch { }
+            }
+        }
+    }
+
+    /// <summary> Registers a menu entry at the given path with the specified action, priority, and icon. </summary>
+    public static void Register(string path, Action action, int priority = 1000, string icon = "")
+    {
+        _entries.Add(new Entry(path, action, priority, icon, typeof(MenuItemAttribute)));
+        _dirty = true;
+    }
+
+    /// <summary> Removes all registered menu entries whose path starts with the given prefix. </summary>
+    public static void UnregisterByPrefix(string prefix)
+    {
+        if (_entries.RemoveAll(e => e.Path.StartsWith(prefix, StringComparison.Ordinal)) > 0)
+            _dirty = true;
+    }
+
+    internal static void Clear()
+    {
+        _entries.Clear();
+        _validators.Clear();
+        _sorted = null;
+        _dirty = false;
+    }
+
+    private static List<Entry> GetSorted()
+    {
+        if (_dirty || _sorted == null)
+        {
+            _sorted = [.. _entries.OrderBy(e => e.Priority)];
+            _dirty = false;
+        }
+        return _sorted;
+    }
+
+    /// <summary> Populates the global MenuRegistry with all registered menu items, building the hierarchy from their paths. </summary>
+    public static void PopulateMenuRegistry()
+    {
+        PopulateRegistryLevel(GetSorted(), "");
+    }
+
+    private static void PopulateRegistryLevel(List<Entry> all, string levelPath)
+    {
+        string prefix = levelPath.Length > 0 ? levelPath + "/" : "";
+
+        var leaves = new List<Entry>();
+        var branchOrder = new List<string>();
+        var branches = new Dictionary<string, List<Entry>>(StringComparer.Ordinal);
+
+        foreach (Entry e in all)
+        {
+            if (!e.Path.StartsWith(prefix, StringComparison.Ordinal)) continue;
+            string rest = e.Path.Substring(prefix.Length);
+            int slash = rest.IndexOf('/');
+            if (slash < 0)
+                leaves.Add(e);
+            else
+            {
+                string key = rest.Substring(0, slash);
+                if (!branches.ContainsKey(key)) { branches[key] = []; branchOrder.Add(key); }
+                branches[key].Add(e);
+            }
+        }
+
+        var items = new List<(int Priority, Entry? Leaf, string? Branch)>();
+        foreach (Entry leaf in leaves) items.Add((leaf.Priority, leaf, null));
+        foreach (string key in branchOrder) items.Add((branches[key].Min(e => e.Priority), null, key));
+        items.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+
+        for (int i = 0; i < items.Count; i++)
+        {
+            (int _, Entry? leaf, string? branch) = items[i];
+
+            bool wantsSep = leaf?.Separator ?? false;
+            if (branch != null)
+                wantsSep = branches[branch].OrderBy(e => e.Priority).First().Separator;
+
+            if (i > 0 && wantsSep && levelPath.Length > 0)
+                MenuRegistry.RegisterSeparator(levelPath);
+
+            if (leaf != null)
+            {
+                Func<bool>? validator = _validators.TryGetValue(leaf.Path, out Func<bool>? v) ? v : null;
+                Func<bool>? isChecked = null;
+                if (typeof(DockPanel).IsAssignableFrom(leaf.DeclaringType))
+                {
+                    Type t = leaf.DeclaringType;
+                    isChecked = () => EditorApplication.Instance?.IsPanelOpen(t) ?? false;
+                }
+                MenuRegistry.Register(leaf.Path, leaf.Action, isChecked: isChecked, isEnabled: validator, icon: leaf.Icon);
+            }
+            else if (branch != null)
+            {
+                string branchPath = levelPath.Length > 0 ? levelPath + "/" + branch : branch;
+                PopulateRegistryLevel(all, branchPath);
+                string? branchIcon = branches[branch].OrderBy(e => e.Priority)
+                    .Select(e => e.Icon)
+                    .FirstOrDefault(ic => !string.IsNullOrEmpty(ic));
+                if (!string.IsNullOrEmpty(branchIcon))
+                    MenuRegistry.RegisterBranchIcon(branchPath, branchIcon);
+            }
+        }
+    }
+
+    /// <summary> Builds a context menu by adding items under the specified root path to the given ContextBuilder. </summary>
+    public static void BuildContextMenu(ContextBuilder builder, string rootPath)
+    {
+        string prefix = rootPath.TrimEnd('/') + "/";
+        var relevant = GetSorted().Where(e => e.Path.StartsWith(prefix, StringComparison.Ordinal)).ToList();
+        BuildLevel(builder, relevant, prefix);
+    }
+
+    private static Action PerTarget(Entry leaf)
+    {
+        IReadOnlyList<GameObject> targets = MenuContext.Targets;
+        if (targets.Count < 2 || leaf.SelectionWide) return leaf.Action;
+        return () =>
+        {
+            try
+            {
+                foreach (GameObject target in targets)
+                {
+                    if (target.IsNotValid()) continue;
+                    MenuContext.Set(target);
+                    leaf.Action();
+                }
+            }
+            finally { MenuContext.SetMany(targets); }
+        };
+    }
+
+    private static void BuildLevel(ContextBuilder builder, List<Entry> entries, string prefix)
+    {
+        var leaves = new List<Entry>();
+        var branchOrder = new List<string>();
+        var branches = new Dictionary<string, List<Entry>>(StringComparer.Ordinal);
+
+        foreach (Entry e in entries)
+        {
+            string rest = e.Path.Substring(prefix.Length);
+            int slash = rest.IndexOf('/');
+            if (slash < 0)
+                leaves.Add(e);
+            else
+            {
+                string key = rest.Substring(0, slash);
+                if (!branches.ContainsKey(key)) { branches[key] = []; branchOrder.Add(key); }
+                branches[key].Add(e);
+            }
+        }
+
+        var items = new List<(int Priority, Entry? Leaf, string? Branch)>();
+        foreach (Entry leaf in leaves) items.Add((leaf.Priority, leaf, null));
+        foreach (string key in branchOrder) items.Add((branches[key].Min(e => e.Priority), null, key));
+        items.Sort((a, b) => a.Priority.CompareTo(b.Priority));
+
+        for (int i = 0; i < items.Count; i++)
+        {
+            (int _, Entry? leaf, string? branch) = items[i];
+
+            bool wantsSep = leaf?.Separator ?? false;
+            if (branch != null)
+                wantsSep = branches[branch].OrderBy(e => e.Priority).First().Separator;
+
+            if (i > 0 && wantsSep) builder.Separator();
+
+            if (leaf != null)
+            {
+                Func<bool>? validator = _validators.TryGetValue(leaf.Path, out Func<bool>? v) ? v : null;
+                builder.Item(leaf.Path.Substring(prefix.Length), PerTarget(leaf), enabled: validator?.Invoke() ?? true, icon: leaf.Icon);
+            }
+            else if (branch != null)
+            {
+                List<Entry> list = branches[branch];
+                string subPrefix = prefix + branch + "/";
+                string icon = list.OrderBy(e => e.Priority).Select(e => e.Icon).FirstOrDefault(ic => !string.IsNullOrEmpty(ic)) ?? "";
+                builder.Submenu(branch, sub => BuildLevel(sub, list, subPrefix), icon);
+            }
+        }
+    }
+}

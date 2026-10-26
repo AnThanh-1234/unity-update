@@ -1,0 +1,401 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+
+using Prowl.Editor.Theming;
+using Prowl.OrigamiUI;
+using Prowl.PaperUI;
+using Prowl.PaperUI.LayoutEngine;
+using Prowl.Quill;
+using Prowl.Runtime;
+using Prowl.Scribe;
+using Prowl.Vector;
+
+using Color = System.Drawing.Color;
+using Gradient = Prowl.Vector.Gradient;
+using VColor = Prowl.Vector.Color;
+
+namespace Prowl.Editor.GUI.Widgets;
+
+/// <summary>
+/// Fluent builder for a Gradient editor field.
+/// Renders an inline gradient preview bar that opens a full gradient editor modal on click.
+/// </summary>
+public sealed class GradientFieldBuilder
+{
+    private readonly Paper _paper;
+    private readonly string _id;
+    private readonly Gradient _value;
+    private readonly Action<Gradient> _setter;
+
+    private UnitValue _width = UnitValue.Stretch();
+    private float _previewHeight = 28f;
+    private bool _readOnly;
+
+    internal GradientFieldBuilder(Paper paper, string id, Gradient value, Action<Gradient> setter)
+    {
+        _paper = paper;
+        _id = id;
+        _value = value;
+        _setter = setter;
+    }
+
+    /// <summary> Sets the width of the gradient field. </summary>
+    public GradientFieldBuilder Width(UnitValue width) { _width = width; return this; }
+    /// <summary> Sets the preview bar height, clamped to a minimum of 16. </summary>
+    public GradientFieldBuilder PreviewHeight(float height) { _previewHeight = MathF.Max(16, height); return this; }
+    /// <summary> Sets the gradient field to read-only, preventing editing. </summary>
+    public GradientFieldBuilder ReadOnly(bool readOnly = true) { _readOnly = readOnly; return this; }
+
+    /// <summary> Renders the gradient field with the configured properties. </summary>
+    public void Show()
+    {
+        if (Origami.IsReadOnly) _readOnly = true;
+        OrigamiTheme theme = Origami.Current;
+        OrigamiMetrics m = theme.Metrics;
+
+        ElementBuilder swatch = _paper.Box($"{_id}_swatch")
+            .Width(_width).Height(_previewHeight)
+            .BorderColor(theme.Neutral.C400).BorderWidth(1)
+            .Hovered.BorderColor(theme.Primary.C400).End()
+            .Rounded(m.Rounding);
+
+        if (!_readOnly)
+        {
+            Gradient gradient = _value;
+            Action<Gradient> setter = _setter;
+            string id = _id;
+            swatch.OnClick(e =>
+            {
+                float anchorX = (float)e.ElementRect.Min.X;
+                float anchorY = (float)e.ElementRect.Max.Y + 2;
+                Modal.Push(new GradientEditorModal(id, gradient, setter, anchorX, anchorY));
+            });
+        }
+
+        using (swatch.Enter())
+        {
+            Gradient gradient = _value;
+            _paper.Box($"{_id}_preview")
+                .Width(UnitValue.Stretch()).Height(_previewHeight)
+                .IsNotInteractable()
+                .OnPostLayout((handle, rect) => _paper.Draw(ref handle, (canvas, r) =>
+                    GradientRenderer.DrawPreview(canvas, r, gradient, theme)));
+        }
+    }
+}
+
+/// <summary>Static entry point for GradientField builder.</summary>
+public static class GradientField
+{
+    /// <summary> Creates a new GradientFieldBuilder for the given paper, id, gradient value, and setter callback. </summary>
+    public static GradientFieldBuilder Create(Paper paper, string id, Gradient value, Action<Gradient> setter)
+        => new GradientFieldBuilder(paper, id, value, setter);
+}
+
+// ================================================================
+//  Gradient Renderer
+// ================================================================
+
+/// <summary> Provides methods for rendering gradient previews. </summary>
+public static class GradientRenderer
+{
+    /// <summary> Draws a gradient preview with a checkerboard background for alpha visibility. </summary>
+    public static void DrawPreview(Canvas canvas, Rect r, Gradient gradient, OrigamiTheme theme)
+    {
+        float x = (float)r.Min.X, y = (float)r.Min.Y;
+        float w = (float)r.Size.X, h = (float)r.Size.Y;
+        float round = theme.Metrics.Rounding;
+
+        // Checkerboard behind (for alpha visibility)
+        float checkSize = 5f;
+        for (float cx = 0; cx < w; cx += checkSize)
+        {
+            for (float cy = 0; cy < h; cy += checkSize)
+            {
+                int ix = (int)(cx / checkSize);
+                int iy = (int)(cy / checkSize);
+                bool light = (ix + iy) % 2 == 0;
+                float cw = MathF.Min(checkSize, w - cx);
+                float ch = MathF.Min(checkSize, h - cy);
+                canvas.RectFilled(x + cx, y + cy, cw, ch,
+                    light ? Color32.FromArgb(255, 180, 180, 180) : Color32.FromArgb(255, 120, 120, 120));
+            }
+        }
+
+        // Gradient fill (per-pixel column)
+        int steps = Math.Max(1, (int)w);
+        for (int i = 0; i < steps; i++)
+        {
+            float t = i / (float)steps;
+            VColor col = gradient.Evaluate(t);
+            canvas.RectFilled(x + i, y, 1.5f, h,
+                Color32.FromArgb((byte)(col.A * 255), (byte)(col.R * 255), (byte)(col.G * 255), (byte)(col.B * 255)));
+        }
+    }
+}
+
+// ================================================================
+//  Gradient Editor Modal
+// ================================================================
+
+internal sealed class GradientEditorModal : IModal
+{
+    private readonly string _id;
+    private readonly Gradient _gradient;
+    private readonly Action<Gradient> _setter;
+    private readonly float _anchorX;
+    private readonly float _anchorY;
+
+    private bool _selectedIsColor = true;
+    private int _selectedKey = -1;
+
+    public bool CloseOnBackdrop => true;
+    public bool CloseOnEscape => true;
+
+    private const float EditorW = 380f;
+    private const float BarHeight = 32f;
+    private const float MarkerH = 14f;
+
+    public GradientEditorModal(string id, Gradient gradient, Action<Gradient> setter, float anchorX, float anchorY)
+    {
+        _id = id;
+        _gradient = gradient;
+        _setter = setter;
+        _anchorX = anchorX;
+        _anchorY = anchorY;
+    }
+
+    public void Draw(Paper paper, int layer, int stackIndex)
+    {
+        OrigamiTheme theme = Origami.Current;
+        OrigamiMetrics m = theme.Metrics;
+        FontFile? font = theme.Font;
+        OrigamiRamp ink = theme.Ink;
+
+        using (paper.Column($"{_id}_gmod")
+            .PositionType(PositionType.SelfDirected)
+            .Position(_anchorX, _anchorY)
+            .Width(EditorW).Height(UnitValue.Auto)
+            .BackgroundColor(theme.Neutral.C300)
+            .BorderColor(ink.C200).BorderWidth(1)
+            .Rounded(m.ContainerRounding)
+            .DropShadow(0, 4, 24, 0, theme.Shadow)
+            .Padding(m.PaddingLarge, m.PaddingLarge, m.PaddingLarge, m.PaddingLarge)
+            .Gap(m.SpacingMedium)
+            .Layer(layer)
+            .ClampToScreen()
+            .StopEventPropagation()
+            .Enter())
+        {
+            float barW = EditorW - m.PaddingLarge * 2;
+
+            // Color markers (top) + Gradient bar + Alpha markers (bottom)
+            DrawGradientArea(paper, font, ink, theme, barW);
+
+            // Selected key editor
+            DrawSelectedKeyEditor(paper, font, theme);
+        }
+    }
+
+    private void DrawGradientArea(Paper paper, Scribe.FontFile? font, OrigamiRamp ink, OrigamiTheme theme, float barW)
+    {
+        float totalH = MarkerH + BarHeight + MarkerH;
+        Gradient gradient = _gradient;
+        string id = _id;
+        int selKey = _selectedKey;
+        bool selIsColor = _selectedIsColor;
+
+        paper.Box($"{id}_gbar")
+            .Width(UnitValue.Stretch()).Height(totalH)
+            .OnClick(e =>
+            {
+                float relX = (float)e.RelativePosition.X;
+                float relY = (float)e.RelativePosition.Y;
+                float w = (float)e.ElementRect.Size.X;
+                float t = MathF.Max(0, MathF.Min(1, relX / w));
+                float threshold = 10f / w;
+
+                if (relY < MarkerH)
+                {
+                    // Color marker area - select or add
+                    int hit = gradient.FindColorKey(t, threshold);
+                    _selectedIsColor = true;
+                    if (hit >= 0)
+                    {
+                        _selectedKey = hit;
+                    }
+                    else
+                    {
+                        VColor col = gradient.Evaluate(t);
+                        _selectedKey = gradient.AddColorKey(t, new VColor(col.R, col.G, col.B, 1));
+                        _setter(gradient);
+                    }
+                }
+                else if (relY > MarkerH + BarHeight)
+                {
+                    // Alpha marker area - select or add
+                    int hit = gradient.FindAlphaKey(t, threshold);
+                    _selectedIsColor = false;
+                    if (hit >= 0)
+                    {
+                        _selectedKey = hit;
+                    }
+                    else
+                    {
+                        _selectedKey = gradient.AddAlphaKey(t, gradient.EvaluateAlpha(t));
+                        _setter(gradient);
+                    }
+                }
+                else
+                {
+                    _selectedKey = -1;
+                }
+            })
+            .OnPostLayout((handle, rect) => paper.Draw(ref handle, (canvas, r) =>
+            {
+                float x = (float)r.Min.X, y = (float)r.Min.Y;
+                float w = (float)r.Size.X;
+                float barY = y + MarkerH;
+
+                // Checkerboard
+                float checkSize = 5f;
+                for (float cx = 0; cx < w; cx += checkSize)
+                    for (float cy = 0; cy < BarHeight; cy += checkSize)
+                    {
+                        bool light = ((int)(cx / checkSize) + (int)(cy / checkSize)) % 2 == 0;
+                        canvas.RectFilled(x + cx, barY + cy,
+                            MathF.Min(checkSize, w - cx), MathF.Min(checkSize, BarHeight - cy),
+                            light ? Color32.FromArgb(255, 180, 180, 180) : Color32.FromArgb(255, 120, 120, 120));
+                    }
+
+                // Gradient fill
+                int steps = Math.Max(1, (int)w);
+                for (int i = 0; i < steps; i++)
+                {
+                    float t = i / (float)steps;
+                    VColor col = gradient.Evaluate(t);
+                    canvas.RectFilled(x + i, barY, 1.5f, BarHeight,
+                        Color32.FromArgb((byte)(col.A * 255), (byte)(col.R * 255), (byte)(col.G * 255), (byte)(col.B * 255)));
+                }
+
+                // Border
+                VColor borderCol = Color32.FromArgb(255, (byte)ink.C300.R, (byte)ink.C300.G, (byte)ink.C300.B);
+                canvas.SetStrokeColor(borderCol);
+                canvas.SetStrokeWidth(1);
+                canvas.BeginPath();
+                float barRound = theme.Metrics.SmallRounding;
+                canvas.RoundedRect(x, barY, w, BarHeight, barRound, barRound, barRound, barRound);
+                canvas.Stroke();
+
+                // Color markers (top)
+                OrigamiRamp primary = theme.Primary;
+                for (int i = 0; i < gradient.ColorKeys.Count; i++)
+                {
+                    GradientColorKey key = gradient.ColorKeys[i];
+                    float mx = x + key.Time * w;
+                    float my = y + MarkerH - 2;
+                    bool sel = selIsColor && selKey == i;
+
+                    VColor kc = Color32.FromArgb(255, (byte)(key.Color.R * 255), (byte)(key.Color.G * 255), (byte)(key.Color.B * 255));
+                    VColor ring = sel ? Color32.FromArgb(255, (byte)primary.C400.R, (byte)primary.C400.G, (byte)primary.C400.B) : borderCol;
+                    canvas.CircleFilled(mx, my - 2, sel ? 5.5f : 4.5f, ring);
+                    canvas.CircleFilled(mx, my - 2, sel ? 3.5f : 2.5f, kc);
+                }
+
+                // Alpha markers (bottom)
+                for (int i = 0; i < gradient.AlphaKeys.Count; i++)
+                {
+                    GradientAlphaKey key = gradient.AlphaKeys[i];
+                    float mx = x + key.Time * w;
+                    float my = barY + BarHeight + 2;
+                    bool sel = !selIsColor && selKey == i;
+
+                    byte g = (byte)(key.Alpha * 255);
+                    VColor kc = Color32.FromArgb(255, g, g, g);
+                    VColor ring = sel ? Color32.FromArgb(255, (byte)primary.C400.R, (byte)primary.C400.G, (byte)primary.C400.B) : borderCol;
+                    canvas.CircleFilled(mx, my + 2, sel ? 5.5f : 4.5f, ring);
+                    canvas.CircleFilled(mx, my + 2, sel ? 3.5f : 2.5f, kc);
+                }
+            }));
+    }
+
+    private void DrawSelectedKeyEditor(Paper paper, Scribe.FontFile? font, OrigamiTheme theme)
+    {
+        if (_selectedKey < 0) return;
+        OrigamiMetrics m = theme.Metrics;
+        Gradient gradient = _gradient;
+
+        if (_selectedIsColor && _selectedKey < gradient.ColorKeys.Count)
+        {
+            GradientColorKey key = gradient.ColorKeys[_selectedKey];
+            int idx = _selectedKey;
+
+            // Time slider
+            Origami.Slider(paper, $"{_id}_gt", key.Time, v =>
+            {
+                GradientColorKey k = gradient.ColorKeys[idx];
+                k.Time = v;
+                _selectedKey = gradient.SetColorKey(idx, k);
+                _setter(gradient);
+            }, 0f, 1f).Format("F3").Show();
+
+            // Color field
+            Origami.ColorField(paper, $"{_id}_gc", key.Color, v =>
+            {
+                GradientColorKey k = gradient.ColorKeys[idx];
+                k.Color = v;
+                gradient.SetColorKey(idx, k);
+                _setter(gradient);
+            }).Show();
+
+            // Delete button
+            if (gradient.ColorKeys.Count > 1)
+            {
+                Origami.Button(paper, $"{_id}_gdel", $"{EditorIcons.Trash} Remove", () =>
+                {
+                    gradient.RemoveColorKey(idx);
+                    _selectedKey = -1;
+                    _setter(gradient);
+                }).Danger().Show();
+            }
+        }
+        else if (!_selectedIsColor && _selectedKey < gradient.AlphaKeys.Count)
+        {
+            GradientAlphaKey key = gradient.AlphaKeys[_selectedKey];
+            int idx = _selectedKey;
+
+            // Time slider
+            Origami.Slider(paper, $"{_id}_at", key.Time, v =>
+            {
+                GradientAlphaKey k = gradient.AlphaKeys[idx];
+                k.Time = v;
+                _selectedKey = gradient.SetAlphaKey(idx, k);
+                _setter(gradient);
+            }, 0f, 1f).Format("F3").Show();
+
+            // Alpha slider
+            Origami.Slider(paper, $"{_id}_aa", key.Alpha, v =>
+            {
+                GradientAlphaKey k = gradient.AlphaKeys[idx];
+                k.Alpha = v;
+                gradient.SetAlphaKey(idx, k);
+                _setter(gradient);
+            }, 0f, 1f).Format("F2").Show();
+
+            // Delete button
+            if (gradient.AlphaKeys.Count > 1)
+            {
+                Origami.Button(paper, $"{_id}_adel", $"{EditorIcons.Trash} Remove", () =>
+                {
+                    gradient.RemoveAlphaKey(idx);
+                    _selectedKey = -1;
+                    _setter(gradient);
+                }).Danger().Show();
+            }
+        }
+    }
+
+}

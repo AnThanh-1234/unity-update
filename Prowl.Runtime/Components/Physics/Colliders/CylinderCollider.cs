@@ -1,0 +1,47 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Jitter2.Collision.Shapes;
+
+using Prowl.Echo;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+[AddComponentMenu("Physics/Colliders/Cylinder Collider")]
+[ComponentIcon("\uf46b")] // Capsules (closest shape)
+public sealed class CylinderCollider : Collider
+{
+    [SerializeField] private float radius = 0.5f;
+    [SerializeField] private float height = 2;
+
+    public float Radius
+    {
+        get => radius;
+        set
+        {
+            radius = value;
+            Rebuild();
+        }
+    }
+
+    public float Height
+    {
+        get => height;
+        set
+        {
+            height = value;
+            Rebuild();
+        }
+    }
+
+    // CylinderShape takes (height, radius) in that order.
+    public override RigidBodyShape[] CreateShapes() => [new CylinderShape(Maths.Max(height, 0.01f), Maths.Max(radius, 0.01f))];
+
+    public override void DrawGizmosSelected()
+    {
+        Debug.PushMatrix(GizmoMatrix);
+        Debug.DrawWireCylinder(Float3.Zero, Quaternion.Identity, radius, height, Color.Green);
+        Debug.PopMatrix();
+    }
+}

@@ -1,0 +1,251 @@
+﻿using System;
+using System.Collections.Generic;
+using System.IO;
+
+using Prowl.Echo;
+using Prowl.Editor.Projects;
+using Prowl.Runtime;
+using Prowl.Runtime.AssetImporting;
+using Prowl.Runtime.MeshFeatures;
+using Prowl.Runtime.Resources;
+
+namespace Prowl.Editor.Importers;
+
+/// <summary> Imports .gltf, .glb, .obj and .fbx model files into the editor asset database. Produces a PrefabAsset with meshes, materials, animations, textures and mesh features as sub-assets. </summary>
+[ImporterFor(".gltf", ".glb", ".obj", ".fbx")]
+public class EditorModelImporter : AssetImporter
+{
+    // 7: Model became a PrefabAsset, which serializes its tree through a backing field.
+    // 8: normals now come from Clay, which splits vertices on hard edges.
+    // 12: Clay negates X instead of Z, so models face +Z as authored, and cameras and lights sit on a child.
+    // 13: only cameras and spot lights sit on a turned child, directional and point lights stay on the node.
+    private const int BaseVersion = 16;
+    /// <summary> Combined version: the importer's own base version plus the aggregate version from MeshFeatureRegistry, so any change to mesh feature generation invalidates the cache. </summary>
+    public override int Version => BaseVersion + MeshFeatureRegistry.AggregateVersion;
+
+    /// <summary>Splits the comma-separated preserve list the inspector stores as one field.</summary>
+    private static string[] SplitNodeNames(string? value) =>
+        string.IsNullOrWhiteSpace(value)
+            ? []
+            : value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+
+    /// <summary> Imports the model file at ctx.AbsolutePath, registers meshes, materials, animations and generated mesh features as sub-assets, and sets the main asset to a PrefabAsset containing the serialized GameObject hierarchy. </summary>
+    public override bool Import(ImportContext ctx)
+    {
+        try
+        {
+            // The editor's resolver never decodes another asset's pixel data itself: external
+            // textures resolve to the already-imported project asset by path/GUID, and embedded ones
+            // are registered as sub-assets. Unconditional, not settings-gated: holds for every
+            // editor import.
+            var importSettings = new ModelImporterSettings { TextureResolver = new EditorModelTextureResolver(ctx) };
+            if (ctx.Settings != null)
+            {
+                EchoObject s = ctx.Settings;
+                importSettings.GenerateNormals = !s.TryGet("generateNormals", out EchoObject? gn) || gn.BoolValue;
+                importSettings.GenerateSmoothNormals = !s.TryGet("generateSmoothNormals", out EchoObject? gsn) || gsn.BoolValue;
+                importSettings.SmoothNormalsAngleDeg = s.TryGet("smoothNormalsAngle", out EchoObject? sna) ? sna.FloatValue : 80f;
+                importSettings.RecalculateNormals = s.TryGet("recalculateNormals", out EchoObject? rn) && rn.BoolValue;
+                importSettings.CalculateTangentSpace = !s.TryGet("calculateTangents", out EchoObject? ct) || ct.BoolValue;
+                importSettings.UnitScale = s.TryGet("unitScale", out EchoObject? us) ? us.FloatValue : 1.0f;
+                importSettings.ImportMaterials = !s.TryGet("importMaterials", out EchoObject? im) || im.BoolValue;
+                importSettings.ImportAnimations = !s.TryGet("importAnimations", out EchoObject? ia) || ia.BoolValue;
+                importSettings.ImportBlendShapes = !s.TryGet("importBlendShapes", out EchoObject? ibs) || ibs.BoolValue;
+                importSettings.OptimizeMeshes = s.TryGet("optimizeMeshes", out EchoObject? om) && om.BoolValue;
+                importSettings.OptimizeHierarchy = s.TryGet("optimizeHierarchy", out EchoObject? oh) && oh.BoolValue;
+                importSettings.PreserveNodeNames = SplitNodeNames(s.TryGet("preserveNodeNames", out EchoObject? pnn) ? pnn.StringValue : null);
+                importSettings.StrictValidation = s.TryGet("strictValidation", out EchoObject? sv) && sv.BoolValue;
+                importSettings.SceneIndex = s.TryGet("sceneIndex", out EchoObject? si) ? si.IntValue : -1;
+                importSettings.ImportCameras = !s.TryGet("importCameras", out EchoObject? ic) || ic.BoolValue;
+                importSettings.ImportLights = !s.TryGet("importLights", out EchoObject? il) || il.BoolValue;
+                importSettings.LoopAnimations = !s.TryGet("loopAnimations", out EchoObject? la) || la.BoolValue;
+                importSettings.RigType = (ModelRigType)(s.TryGet("rigType", out EchoObject? rt) ? rt.IntValue : (int)ModelRigType.Generic);
+                importSettings.AnimationSampleRate = s.TryGet("animationSampleRate", out EchoObject? asr) ? asr.FloatValue : 30f;
+                importSettings.ClipOverrides = ModelImportOverrides.ReadClips(s);
+                importSettings.MaterialResolver = new ExtractedMaterialResolver(s);
+                importSettings.HumanoidBoneMap = ModelImportOverrides.ReadHumanoidMap(s);
+                // Off by default (slow; some models ship their own UV2). The importer runs the
+                // unwrap in its post-process so the baked UV2 is captured before serialization.
+                importSettings.GenerateLightmapUVs = s.TryGet("generateLightmapUVs", out EchoObject? glu) && glu.BoolValue;
+            }
+
+            // 1. Import creates live meshes, materials, animations, GO hierarchy (+ UV2 if enabled).
+            var importer = new ModelImporter();
+            ModelImportResult data = importer.Import(new FileInfo(ctx.AbsolutePath), importSettings);
+
+            // 2. Register sub-assets assigns deterministic GUIDs immediately
+            // Order: the model file has no stable per-mesh key of its own, and it is read front to back.
+            string[] meshIdentities = new string[data.Meshes.Count];
+            for (int i = 0; i < data.Meshes.Count; i++)
+                meshIdentities[i] = ctx.AddSubAsset(data.Meshes[i].Name ?? $"Mesh_{i}", data.Meshes[i], SubAssetIdentity.Order);
+
+            for (int i = 0; i < data.Materials.Count; i++)
+                ctx.AddSubAsset(data.Materials[i].Name ?? $"Material_{i}", data.Materials[i], SubAssetIdentity.Order);
+
+            if (data.Avatar != null)
+                ctx.AddSubAsset(data.Avatar.Name ?? "Avatar", data.Avatar, SubAssetIdentity.Order);
+
+            for (int i = 0; i < data.Animations.Count; i++)
+                ctx.AddSubAsset(data.Animations[i].Name ?? $"Animation_{i}", data.Animations[i], SubAssetIdentity.Order);
+
+            // Model-referenced textures are already resolved by this point: an external one is the database's
+            // texture, and an embedded one is registered as a sub-asset, both by EditorModelTextureResolver
+            // while importer.Import() ran above.
+
+            // 2b. Generate mesh features (SDF, BVH, Prism, ...) per mesh, registered as sub-assets.
+            MeshFeatureImporter.GenerateAll(data.Meshes, ctx.Settings, ctx, meshIdentities);
+
+            // 3. Serialize GO hierarchy. Sub-assets have their IDs, so they serialize as references.
+            //    Tracked (matching SceneImporter/PrefabImporter) so the prefab's own dependency list
+            //    reflects what its GameObject hierarchy actually references.
+            //    A model is a prefab: dropping one into a scene produces an instance linked back here,
+            //    so changing import settings and reimporting updates those instances in place.
+            var prefab = new PrefabAsset { Name = ctx.FileName, InstanceType = PrefabInstanceType.Model };
+            if (data.RootGO != null)
+            {
+                // The tree is built fresh from the file on every import, so its identities would be new
+                // every time and every instance in the project would lose its overrides on any reimport.
+                StabilizeIdentities(data.RootGO);
+
+                SerializationContext goSerCtx = ImportHelper.CreateTrackingContext(out HashSet<Guid>? goDependencies);
+                prefab.GameObjectData = Serializer.Serialize(typeof(object), data.RootGO, goSerCtx);
+                foreach (Guid dep in goDependencies)
+                    ctx.AddDependency(dep);
+            }
+
+            ctx.SetMainAsset(prefab);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Failed to import model: {ctx.AbsolutePath}\n{ex.Message}");
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Gives every object an identity derived from where it sits rather than from its constructor, so
+    /// importing the same file twice produces the same ones and instances keep their overrides across a
+    /// reimport. Renaming or moving a node therefore reads as a different object and orphans its
+    /// overrides, which is unavoidable while the source file carries no identities of its own.
+    /// </summary>
+    internal static void StabilizeIdentities(GameObject go, string path = "$Root")
+    {
+        go.SetIdentifier(BuiltInAssets.DeterministicGuid($"$GeneratedPrefab/{path}"));
+
+        var perType = new Dictionary<string, int>();
+        foreach (Component component in go.GetComponents<Component>())
+        {
+            string type = component.GetType().FullName ?? component.GetType().Name;
+            perType.TryGetValue(type, out int ordinal);
+            perType[type] = ordinal + 1;
+
+            component.Identifier = BuiltInAssets.DeterministicGuid($"$GeneratedPrefab/{path}#{type}#{ordinal}");
+        }
+
+        // Siblings can share a name, so the key says which one of those this is.
+        var perName = new Dictionary<string, int>();
+        foreach (GameObject child in go.Children)
+        {
+            perName.TryGetValue(child.Name, out int ordinal);
+            perName[child.Name] = ordinal + 1;
+
+            StabilizeIdentities(child, ordinal == 0 ? $"{path}/{child.Name}" : $"{path}/{child.Name}[{ordinal}]");
+        }
+    }
+
+    /// <summary> Returns the default import settings as an EchoObject compound, including normals, tangents, UVs, animation wrap mode, camera/light import toggles and mesh feature defaults. </summary>
+    public override EchoObject? DefaultSettings()
+    {
+        var s = EchoObject.NewCompound();
+        s["generateNormals"] = new EchoObject(true);
+        s["generateSmoothNormals"] = new EchoObject(true);
+        s["smoothNormalsAngle"] = new EchoObject(80.0f);
+        s["recalculateNormals"] = new EchoObject(false);
+        s["calculateTangents"] = new EchoObject(true);
+        s["flipUVs"] = new EchoObject(true);
+        s["unitScale"] = new EchoObject(1.0f);
+        s["importCameras"] = new EchoObject(true);
+        s["importLights"] = new EchoObject(true);
+        s["loopAnimations"] = new EchoObject(true);
+        s["rigType"] = new EchoObject((int)ModelRigType.Generic);
+        s["animationSampleRate"] = new EchoObject(30.0f);
+        s[ModelImportKeys.Clips] = EchoObject.NewCompound();
+        s[ModelImportKeys.MaterialRemap] = EchoObject.NewCompound();
+        s["generateLightmapUVs"] = new EchoObject(false);
+        MeshFeatureRegistry.PopulateDefaultSettings(s);
+        return s;
+    }
+}
+
+/// <summary>
+/// The editor's <see cref="IModelTextureResolver"/>: never decodes another asset's pixel data.
+/// An externally referenced texture is resolved purely by path, against the asset database's
+/// existing GUID for that file. An embedded texture is registered as a proper sub-asset of the
+/// model for the asset database to own and cache (this is the one case that still has to decode -
+/// there's no separate file for the asset database to already know about).
+/// </summary>
+internal sealed class EditorModelTextureResolver : IModelTextureResolver
+{
+    private readonly ImportContext _ctx;
+    private readonly string _assetsRoot;
+    private readonly EditorAssetBackend? _db;
+
+    public EditorModelTextureResolver(ImportContext ctx)
+    {
+        _ctx = ctx;
+        // Project.AssetsPath is a plain Path.Combine(RootPath, "Assets"), not run through
+        // GetFullPath - sourcePath (below) comes from Clay's own, separately-normalized
+        // Path.GetFullPath pipeline. Normalizing both through GetFullPath here means a prefix
+        // comparison between them is comparing like with like, even if RootPath itself has a
+        // trailing separator or other cosmetic difference GetFullPath would otherwise collapse.
+        string assetsRoot = Project.Current?.AssetsPath ?? "";
+        _assetsRoot = string.IsNullOrEmpty(assetsRoot) ? "" : Path.GetFullPath(assetsRoot);
+        _db = EditorAssetBackend.Instance;
+    }
+
+    // A texture file keeps its own import settings, its sRGB setting included
+    public Texture2D? ResolveExternal(string sourcePath, bool srgb)
+    {
+        if (_db == null || string.IsNullOrEmpty(_assetsRoot)) return null;
+
+        // sourcePath is always already a resolved, existing, absolute path (guaranteed by Clay's
+        // Texture.SourcePath contract) - a plain prefix check + relative-path computation is enough,
+        // no need to re-resolve it against the model's own directory.
+        if (!sourcePath.StartsWith(_assetsRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            Debug.LogWarning($"[Clay] External texture '{sourcePath}' is not under the project's " +
+                $"Assets folder '{_assetsRoot}' - using the default fallback texture instead.");
+            return null;
+        }
+
+        string relativePath = Path.GetRelativePath(_assetsRoot, sourcePath).Replace('\\', '/');
+        AssetEntry? entry = _db.GetEntry(relativePath);
+        if (entry == null)
+        {
+            Debug.LogWarning($"[Clay] External texture '{sourcePath}' (resolved to '{relativePath}') has no " +
+                "tracked asset entry - using the default fallback texture instead. Has it been imported yet?");
+            return null;
+        }
+
+        _ctx.AddDependency(entry.Guid);
+        return AssetDatabase.Get<Texture2D>(entry.Guid);
+    }
+
+    public Texture2D? ResolveEmbedded(string? name, byte[] encodedBytes, string? mimeType, bool srgb)
+    {
+        try
+        {
+            using var ms = new MemoryStream(encodedBytes);
+            var tex = Texture2D.FromStream(ms, mipmaps: true, srgb: srgb);
+            tex.Name = string.IsNullOrEmpty(name) ? "EmbeddedTexture" : name;
+            _ctx.AddSubAsset(tex.Name, tex, SubAssetIdentity.Order);
+            return tex;
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"[Clay] Failed to load embedded texture '{name ?? "(unnamed)"}': {ex.Message}");
+            return null;
+        }
+    }
+}

@@ -1,0 +1,49 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Jitter2.Collision.Shapes;
+
+using Prowl.Echo;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+[AddComponentMenu("Physics/Colliders/Capsule Collider")]
+[ComponentIcon("\uf46b")] // Capsules
+public sealed class CapsuleCollider : Collider
+{
+    [SerializeField] private float radius = 0.5f;
+    [SerializeField] private float height = 2;
+
+    public float Radius
+    {
+        get => radius;
+        set
+        {
+            radius = value;
+            Rebuild();
+        }
+    }
+
+    public float Height
+    {
+        get => height;
+        set
+        {
+            height = value;
+            Rebuild();
+        }
+    }
+
+    private float SegmentLength => Maths.Max(Maths.Max(height, 0.01f) - Maths.Max(radius, 0.01f) * 2.0f, 0.01f);
+
+    public override RigidBodyShape[] CreateShapes() => [new CapsuleShape(Maths.Max(radius, 0.01f), SegmentLength)];
+
+    public override void DrawGizmosSelected()
+    {
+        float halfSegment = SegmentLength * 0.5f;
+        Debug.PushMatrix(GizmoMatrix);
+        Debug.DrawWireCapsule(new Float3(0, -halfSegment, 0), new Float3(0, halfSegment, 0), radius, Color.Green);
+        Debug.PopMatrix();
+    }
+}

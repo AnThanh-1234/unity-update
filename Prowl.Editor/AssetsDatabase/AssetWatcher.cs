@@ -1,0 +1,168 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+namespace Prowl.Editor;
+
+/// <summary> Types of file system changes that the asset watcher can detect. </summary>
+public enum FileEventType { Created, Modified, Deleted, Renamed }
+
+/// <summary> Represents a single file system change detected by the asset watcher. </summary>
+public struct FileEvent
+{
+    /// <summary> The kind of file system change. </summary>
+    public FileEventType Type;
+    /// <summary> The full path of the affected file. </summary>
+    public string Path;
+    /// <summary> The previous path of the file, only set when Type is Renamed. </summary>
+    public string? OldPath; // For renames
+}
+
+/// <summary>
+/// Watches the Assets/ directory for file changes using FileSystemWatcher.
+/// Debounces and coalesces events for processing on the main thread.
+/// </summary>
+public class AssetWatcher : IDisposable
+{
+    private FileSystemWatcher? _watcher;
+    private readonly object _lock = new();
+    private readonly List<FileEvent> _pendingEvents = [];
+    private DateTime _lastEventTime = DateTime.MinValue;
+    private const double DebounceMs = 300;
+
+    /// <summary> Creates a FileSystemWatcher on the given directory and begins monitoring for file changes. </summary>
+    public void Start(string assetsPath)
+    {
+        if (!Directory.Exists(assetsPath)) return;
+
+        // Dispose any existing watcher before creating a new one
+        Stop();
+
+        _watcher = new FileSystemWatcher(assetsPath)
+        {
+            IncludeSubdirectories = true,
+            NotifyFilter = NotifyFilters.FileName | NotifyFilters.DirectoryName
+                         | NotifyFilters.LastWrite | NotifyFilters.CreationTime
+                         | NotifyFilters.Size,
+            InternalBufferSize = 64 * 1024, // 64KB buffer to reduce overflow risk
+        };
+
+        _watcher.Created += (_, e) => QueueEvent(FileEventType.Created, e.FullPath);
+        _watcher.Changed += (_, e) => QueueEvent(FileEventType.Modified, e.FullPath);
+        _watcher.Deleted += (_, e) => QueueEvent(FileEventType.Deleted, e.FullPath);
+        _watcher.Renamed += (_, e) => QueueEvent(FileEventType.Renamed, e.FullPath, e.OldFullPath);
+        _watcher.Error += (_, e) =>
+        {
+            Runtime.Debug.LogError($"AssetWatcher buffer overflow some file changes may have been missed. Consider reimporting. Error: {e.GetException().Message}");
+        };
+
+        // Enable after all handlers attached
+        _watcher.EnableRaisingEvents = true;
+    }
+
+    /// <summary> Stops monitoring and disposes the underlying FileSystemWatcher. </summary>
+    public void Stop()
+    {
+        if (_watcher != null)
+        {
+            _watcher.EnableRaisingEvents = false;
+            _watcher.Dispose();
+            _watcher = null;
+        }
+    }
+
+    private void QueueEvent(FileEventType type, string path, string? oldPath = null)
+    {
+        lock (_lock)
+        {
+            _pendingEvents.Add(new FileEvent { Type = type, Path = path, OldPath = oldPath });
+            _lastEventTime = DateTime.UtcNow;
+        }
+    }
+
+    /// <summary>
+    /// Called on the main thread each frame. Returns debounced, coalesced events.
+    /// </summary>
+    /// <param name="force">Skip the debounce wait and return whatever is queued right now. For callers
+    /// that must not run against stale state (starting a build, regaining focus) and would otherwise
+    /// race the debounce window.</param>
+    public List<FileEvent> DrainEvents(bool force = false)
+    {
+        lock (_lock)
+        {
+            if (_pendingEvents.Count == 0) return [];
+
+            // Wait for debounce period
+            if (!force && (DateTime.UtcNow - _lastEventTime).TotalMilliseconds < DebounceMs)
+                return [];
+
+            // Coalesce: for each path, determine the net effect.
+            // Renames are special they track OldPath.
+            // For everything else, we just care about the final state:
+            //   - If a Delete was the last event, it's deleted.
+            //   - If Created or Modified was last, it needs import/reimport.
+            //   - Created+Deleted cancels out.
+            var coalesced = new Dictionary<string, FileEvent>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (FileEvent evt in _pendingEvents)
+            {
+                // Renames always win they're the most specific
+                if (evt.Type == FileEventType.Renamed)
+                {
+                    // Remove any pending event on the old path
+                    if (evt.OldPath != null)
+                        coalesced.Remove(evt.OldPath);
+                    coalesced[evt.Path] = evt;
+                    continue;
+                }
+
+                if (coalesced.TryGetValue(evt.Path, out FileEvent existing))
+                {
+                    // Created + Deleted = cancel out entirely
+                    if (existing.Type == FileEventType.Created && evt.Type == FileEventType.Deleted)
+                    {
+                        coalesced.Remove(evt.Path);
+                        continue;
+                    }
+
+                    // Any event followed by Delete = Delete
+                    if (evt.Type == FileEventType.Deleted)
+                    {
+                        coalesced[evt.Path] = evt;
+                        continue;
+                    }
+
+                    // Created + Modified = still Created (creation includes the content)
+                    if (existing.Type == FileEventType.Created && evt.Type == FileEventType.Modified)
+                        continue;
+
+                    // Multiple Modified = single Modified
+                    if (existing.Type == FileEventType.Modified && evt.Type == FileEventType.Modified)
+                        continue;
+
+                    // Rename + Modified = keep the Rename (it already implies the file's presence and
+                    // content). Letting the Modify win would drop OldPath and mint a duplicate GUID.
+                    if (existing.Type == FileEventType.Renamed && evt.Type == FileEventType.Modified)
+                        continue;
+
+                    // Everything else: latest wins
+                    coalesced[evt.Path] = evt;
+                }
+                else
+                {
+                    coalesced[evt.Path] = evt;
+                }
+            }
+
+            _pendingEvents.Clear();
+            return [.. coalesced.Values];
+        }
+    }
+
+    /// <summary> Stops the watcher and releases all resources. </summary>
+    public void Dispose()
+    {
+        Stop();
+    }
+}

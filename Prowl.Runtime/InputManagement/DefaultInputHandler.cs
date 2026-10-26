@@ -1,0 +1,424 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+using Prowl.PaperUI;
+using Prowl.Runtime.Diagnostics;
+using Prowl.Vector;
+
+using Silk.NET.GLFW;
+using Silk.NET.Input;
+
+namespace Prowl.Runtime;
+
+public class DefaultInputHandler : IInputHandler, IDisposable
+{
+    public IInputContext Context { get; internal set; }
+
+    public IReadOnlyList<IKeyboard> Keyboards => Context.Keyboards;
+    public IReadOnlyList<IMouse> Mice => Context.Mice;
+
+    // Enum.GetValues builds a new array on every call, and these are walked every frame.
+    // Distinct drops aliases like D0, which would otherwise update the same key twice a frame and hide its press.
+    private static readonly KeyCode[] s_keyCodes = [.. Enum.GetValues<KeyCode>().Distinct()];
+    private static readonly MouseButton[] s_mouseButtons = Enum.GetValues<MouseButton>();
+    private static readonly GamepadButton[] s_gamepadButtons = Enum.GetValues<GamepadButton>();
+    public IReadOnlyList<IJoystick> Joysticks => Context.Joysticks;
+
+    /// <summary>
+    /// The system clipboard as text. Empty when the clipboard holds content that cannot be converted
+    /// to text, such as an image, a file list or a shell object.
+    /// </summary>
+    public string Clipboard
+    {
+        get
+        {
+            if (OperatingSystem.IsWindows()) return Win32Clipboard.ReadText() ?? "";
+
+            if (Context.Keyboards.Count == 0) return "";
+            try { return Context.Keyboards[0].ClipboardText ?? ""; }
+            catch (GlfwException) { return ""; }
+        }
+        set
+        {
+            if (Context.Keyboards.Count == 0) return;
+
+            // Another application holding the clipboard fails the open, which GLFW reports the same
+            // way it reports everything else.
+            try { Context.Keyboards[0].ClipboardText = value ?? ""; }
+            catch (GlfwException) { }
+        }
+    }
+
+
+    private Int2 _currentMousePos;
+    private Int2 _prevMousePos;
+
+    public Int2 PrevMousePosition => _prevMousePos;
+    public Int2 MousePosition
+    {
+        get => _currentMousePos;
+        set
+        {
+            _prevMousePos = value;
+            _currentMousePos = value;
+            Mice[0].Position = (Float2)value;
+        }
+    }
+    public Float2 MouseDelta
+    {
+        get
+        {
+            Int2 delta = _currentMousePos - _prevMousePos;
+            return new Float2(delta.X, delta.Y); // Invert Y to match gamepad (up = positive)
+        }
+    }
+    public float MouseWheelDelta => Mice[0].ScrollWheels[0].Y;
+    public float MouseWheelDeltaX => Mice[0].ScrollWheels[0].X;
+
+    private Dictionary<KeyCode, bool> wasKeyPressed = [];
+    private Dictionary<KeyCode, bool> isKeyPressed = [];
+    private Dictionary<MouseButton, bool> wasMousePressed = [];
+    private Dictionary<MouseButton, bool> isMousePressed = [];
+
+    // Gamepad state tracking (per device)
+    private Dictionary<int, Dictionary<GamepadButton, bool>> wasGamepadButtonPressed = [];
+    private Dictionary<int, Dictionary<GamepadButton, bool>> isGamepadButtonPressed = [];
+
+    private Queue<char> pressedChars { get; set; } = new();
+
+    // Characters typed this frame, accumulated as KeyChar events arrive (during DoEvents) and cleared at
+    // the frame boundary (BeginFrame). Unlike the pressedChars queue this is read non-destructively, so
+    // any number of consumers - Paper, GameObject UI, user UI - can all see the same input each frame.
+    private string _inputString = string.Empty;
+
+    public event Action<KeyCode, bool> OnKeyEvent;
+    public event Action<MouseButton, float, float, bool, bool> OnMouseEvent;
+
+    public bool IsAnyKeyDown => isKeyPressed.ContainsValue(true);
+
+    public DefaultInputHandler(IInputContext context)
+    {
+        Context = context;
+        _prevMousePos = (Int2)(Float2)Mice[0].Position;
+        _currentMousePos = (Int2)(Float2)Mice[0].Position;
+
+        // initialize key states
+        foreach (KeyCode key in s_keyCodes)
+        {
+            if (key != KeyCode.Unknown)
+            {
+                wasKeyPressed[key] = false;
+                isKeyPressed[key] = false;
+            }
+        }
+
+        foreach (MouseButton button in s_mouseButtons)
+        {
+            if (button != MouseButton.Unknown)
+            {
+                wasMousePressed[button] = false;
+                isMousePressed[button] = false;
+            }
+        }
+
+        // Initialize gamepad state for all connected gamepads
+        for (int i = 0; i < Context.Gamepads.Count; i++)
+        {
+            InitializeGamepadState(i);
+        }
+
+        foreach (IKeyboard keyboard in Keyboards)
+            keyboard.KeyChar += (keyboard, c) => { pressedChars.Enqueue(c); _inputString += c; };
+
+        UpdateKeyStates();
+    }
+
+    private void InitializeGamepadState(int gamepadIndex)
+    {
+        wasGamepadButtonPressed[gamepadIndex] = [];
+        isGamepadButtonPressed[gamepadIndex] = [];
+
+        foreach (GamepadButton button in s_gamepadButtons)
+        {
+            if (button != GamepadButton.Unknown)
+            {
+                wasGamepadButtonPressed[gamepadIndex][button] = false;
+                isGamepadButtonPressed[gamepadIndex][button] = false;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Drops the previous frame's typed characters, before DoEvents appends this frame's. Clearing here
+    /// rather than in LateUpdate is what lets them survive the whole frame - the editor pumps the Game
+    /// View's Paper during Render, which is after LateUpdate, so a clear there dropped every character
+    /// before that Paper could see one.
+    /// </summary>
+    internal void BeginFrame()
+    {
+        _inputString = string.Empty;
+        pressedChars.Clear();
+    }
+
+    internal void LateUpdate()
+    {
+        using FrameStatScope stats = FrameStats.Input.Scope();
+
+        // Before sampling, so this frame reports the clamped position and the delta at the wall is zero
+        ConfineCursor();
+
+        _prevMousePos = _currentMousePos;
+        _currentMousePos = (Int2)(Float2)Mice[0].Position;
+        if (!_prevMousePos.Equals(_currentMousePos))
+        {
+            if (isMousePressed[MouseButton.Left])
+                OnMouseEvent?.Invoke(MouseButton.Left, MousePosition.X, MousePosition.Y, false, true);
+            else if (isMousePressed[MouseButton.Right])
+                OnMouseEvent?.Invoke(MouseButton.Right, MousePosition.X, MousePosition.Y, false, true);
+            else if (isMousePressed[MouseButton.Middle])
+                OnMouseEvent?.Invoke(MouseButton.Middle, MousePosition.X, MousePosition.Y, false, true);
+            else
+                OnMouseEvent?.Invoke(MouseButton.Unknown, MousePosition.X, MousePosition.Y, false, true);
+        }
+        UpdateKeyStates();
+    }
+
+    // Update the state of each key
+    private void UpdateKeyStates()
+    {
+        foreach (KeyCode key in s_keyCodes)
+        {
+            if (key != KeyCode.Unknown)
+            {
+                wasKeyPressed[key] = isKeyPressed[key];
+                isKeyPressed[key] = false;
+                IReadOnlyList<IKeyboard> keyboards = Keyboards;
+                for (int k = 0; k < keyboards.Count; k++)
+                    if (keyboards[k].IsKeyPressed((Silk.NET.Input.Key)key))
+                    {
+                        isKeyPressed[key] = true;
+                        break;
+                    }
+
+                if (wasKeyPressed[key] != isKeyPressed[key])
+                    OnKeyEvent?.Invoke(key, isKeyPressed[key]);
+            }
+        }
+
+        foreach (MouseButton button in s_mouseButtons)
+        {
+            if (button != MouseButton.Unknown)
+            {
+                wasMousePressed[button] = isMousePressed[button];
+                isMousePressed[button] = false;
+                IReadOnlyList<IMouse> mice = Mice;
+                for (int m = 0; m < mice.Count; m++)
+                    if (mice[m].IsButtonPressed((Silk.NET.Input.MouseButton)button))
+                    {
+                        isMousePressed[button] = true;
+                        break;
+                    }
+                if (wasMousePressed[button] != isMousePressed[button])
+                    OnMouseEvent?.Invoke(button, MousePosition.X, MousePosition.Y, isMousePressed[button], false);
+            }
+        }
+
+        // Update gamepad button states
+        for (int gamepadIndex = 0; gamepadIndex < Context.Gamepads.Count; gamepadIndex++)
+        {
+            if (!Context.Gamepads[gamepadIndex].IsConnected)
+                continue;
+
+            // Initialize if needed
+            if (!isGamepadButtonPressed.ContainsKey(gamepadIndex))
+                InitializeGamepadState(gamepadIndex);
+
+            IGamepad gamepad = Context.Gamepads[gamepadIndex];
+            foreach (GamepadButton button in s_gamepadButtons)
+            {
+                if (button != GamepadButton.Unknown)
+                {
+                    wasGamepadButtonPressed[gamepadIndex][button] = isGamepadButtonPressed[gamepadIndex][button];
+                    isGamepadButtonPressed[gamepadIndex][button] = false;
+
+                    // Check if button is pressed
+                    int buttonIndex = (int)button;
+                    if (buttonIndex < gamepad.Buttons.Count && gamepad.Buttons[buttonIndex].Pressed)
+                    {
+                        isGamepadButtonPressed[gamepadIndex][button] = true;
+                    }
+                }
+            }
+        }
+    }
+
+    public char? GetPressedChar()
+    {
+        if (pressedChars.TryDequeue(out char c))
+            return c;
+        return null;
+    }
+
+    public string InputString => _inputString;
+
+    // TryGetValue (not the indexer) so an unmapped key/button - e.g. KeyCode.Unknown, which isn't in
+    // the dictionaries - returns false instead of throwing KeyNotFoundException.
+    private static bool Down(Dictionary<KeyCode, bool> map, KeyCode key) => map.TryGetValue(key, out bool v) && v;
+    private static bool Down(Dictionary<MouseButton, bool> map, MouseButton btn) => map.TryGetValue(btn, out bool v) && v;
+
+    public bool GetKey(KeyCode key) => Down(isKeyPressed, key);
+
+    public bool GetKeyDown(KeyCode key) => Down(isKeyPressed, key) && !Down(wasKeyPressed, key);
+
+    public bool GetKeyUp(KeyCode key) => !Down(isKeyPressed, key) && Down(wasKeyPressed, key);
+
+    public bool GetMouseButton(int button) => Down(isMousePressed, (MouseButton)button);
+
+    public bool GetMouseButtonDown(int button) => Down(isMousePressed, (MouseButton)button) && !Down(wasMousePressed, (MouseButton)button);
+
+    public bool GetMouseButtonUp(int button) => !Down(isMousePressed, (MouseButton)button) && Down(wasMousePressed, (MouseButton)button);
+
+    public void ApplyCursorState(bool visible, CursorLockMode mode)
+    {
+        ICursor cursor = Mice[0].Cursor;
+        CursorMode previous = cursor.CursorMode;
+        CursorMode next = mode == CursorLockMode.Locked
+            ? CursorMode.Disabled
+            : visible ? CursorMode.Normal : CursorMode.Hidden;
+
+        if (previous == next)
+            return;
+
+        cursor.CursorMode = next;
+
+        // Leaving Disabled restores the real position, but the cached ones still hold the unbounded
+        // virtual coordinate from while it was locked - without this the next MouseDelta is that jump.
+        if (previous == CursorMode.Disabled)
+            _prevMousePos = _currentMousePos = (Int2)(Float2)Mice[0].Position;
+    }
+
+    // GLFW has no hidden-and-confined mode, so hold the cursor inside the bounds ourselves. Skipped
+    // while unfocused so alt-tabbing away doesn't fight the user for the pointer.
+    private void ConfineCursor()
+    {
+        if (Input.CursorLockState != CursorLockMode.Confined || !Window.IsFocused)
+            return;
+
+        Int2 pos = (Int2)(Float2)Mice[0].Position;
+        Int2 clamped = Input.CursorConfineBounds.ClosestPointTo(pos);
+        if (!clamped.Equals(pos))
+            Mice[0].Position = (Float2)clamped;
+    }
+
+    public void SetCursorShape(PaperCursor shape, int miceIndex = 0)
+    {
+        ICursor cursor = Mice[miceIndex].Cursor;
+        // Only relevant while the cursor is visible; don't fight a locked/hidden cursor (FPS mode).
+        if (cursor.CursorMode != CursorMode.Normal)
+            return;
+
+        // Silk.NET has no grab/help shapes, so those fall back to the hand or the arrow.
+        cursor.StandardCursor = shape switch
+        {
+            PaperCursor.Pointer or PaperCursor.Grab or PaperCursor.Grabbing => StandardCursor.Hand,
+            PaperCursor.Text => StandardCursor.IBeam,
+            PaperCursor.Crosshair => StandardCursor.Crosshair,
+            PaperCursor.ResizeHorizontal => StandardCursor.HResize,
+            PaperCursor.ResizeVertical => StandardCursor.VResize,
+            PaperCursor.ResizeNWSE => StandardCursor.NwseResize,
+            PaperCursor.ResizeNESW => StandardCursor.NeswResize,
+            PaperCursor.ResizeAll => StandardCursor.ResizeAll,
+            PaperCursor.NotAllowed => StandardCursor.NotAllowed,
+            PaperCursor.Wait => StandardCursor.Wait,
+            _ => StandardCursor.Default,
+        };
+    }
+
+    // Gamepad methods implementation
+
+    // Backends expose a fixed block of slots (16 under GLFW) whether or not anything is plugged into
+    // them, so Context.Gamepads.Count is a capacity rather than a device count. Every other method here
+    // already gates on IsGamepadConnected; this one now agrees with them.
+    public int GetGamepadCount()
+    {
+        int count = 0;
+        for (int i = 0; i < Context.Gamepads.Count; i++)
+            if (Context.Gamepads[i].IsConnected)
+                count++;
+        return count;
+    }
+
+    public int GetGamepadSlotCount() => Context.Gamepads.Count;
+
+    public bool IsGamepadConnected(int gamepadIndex)
+    {
+        return gamepadIndex >= 0 && gamepadIndex < Context.Gamepads.Count && Context.Gamepads[gamepadIndex].IsConnected;
+    }
+
+    public bool GetGamepadButton(int gamepadIndex, GamepadButton button)
+    {
+        if (!IsGamepadConnected(gamepadIndex) || !isGamepadButtonPressed.ContainsKey(gamepadIndex))
+            return false;
+        return isGamepadButtonPressed[gamepadIndex].GetValueOrDefault(button, false);
+    }
+
+    public bool GetGamepadButtonDown(int gamepadIndex, GamepadButton button)
+    {
+        if (!IsGamepadConnected(gamepadIndex) || !isGamepadButtonPressed.ContainsKey(gamepadIndex))
+            return false;
+        return isGamepadButtonPressed[gamepadIndex].GetValueOrDefault(button, false) &&
+               !wasGamepadButtonPressed[gamepadIndex].GetValueOrDefault(button, false);
+    }
+
+    public bool GetGamepadButtonUp(int gamepadIndex, GamepadButton button)
+    {
+        if (!IsGamepadConnected(gamepadIndex) || !isGamepadButtonPressed.ContainsKey(gamepadIndex))
+            return false;
+        return !isGamepadButtonPressed[gamepadIndex].GetValueOrDefault(button, false) &&
+               wasGamepadButtonPressed[gamepadIndex].GetValueOrDefault(button, false);
+    }
+
+    public Float2 GetGamepadAxis(int gamepadIndex, int axisIndex)
+    {
+        if (!IsGamepadConnected(gamepadIndex))
+            return Float2.Zero;
+
+        IGamepad gamepad = Context.Gamepads[gamepadIndex];
+        if (axisIndex < 0 || axisIndex >= gamepad.Thumbsticks.Count)
+            return Float2.Zero;
+
+        Thumbstick thumbstick = gamepad.Thumbsticks[axisIndex];
+        return new Float2(thumbstick.X, -thumbstick.Y); // We flip y to make UP on the stick positive
+    }
+
+    public float GetGamepadTrigger(int gamepadIndex, int triggerIndex)
+    {
+        if (!IsGamepadConnected(gamepadIndex))
+            return 0.0f;
+
+        IGamepad gamepad = Context.Gamepads[gamepadIndex];
+        if (triggerIndex < 0 || triggerIndex >= gamepad.Triggers.Count)
+            return 0.0f;
+
+        return gamepad.Triggers[triggerIndex].Position;
+    }
+
+    public void SetGamepadVibration(int gamepadIndex, float leftMotor, float rightMotor)
+    {
+        if (!IsGamepadConnected(gamepadIndex))
+            return;
+
+        IGamepad gamepad = Context.Gamepads[gamepadIndex];
+        if (gamepad.VibrationMotors.Count >= 2)
+        {
+            gamepad.VibrationMotors[0].Speed = (float)leftMotor;
+            gamepad.VibrationMotors[1].Speed = (float)rightMotor;
+        }
+    }
+
+    public void Dispose() => Context.Dispose();
+}

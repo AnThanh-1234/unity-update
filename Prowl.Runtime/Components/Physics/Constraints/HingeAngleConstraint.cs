@@ -1,0 +1,197 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Jitter2;
+using Jitter2.Dynamics;
+using Jitter2.Dynamics.Constraints;
+
+using Prowl.Echo;
+using Prowl.Vector;
+
+namespace Prowl.Runtime;
+
+/// <summary>
+/// Constrains two bodies to only allow rotation around a specified axis, removing two angular degrees of freedom.
+/// A hinge joint that can optionally enforce angle limits.
+/// </summary>
+[AddComponentMenu("Physics/Constraints/Hinge Angle")]
+public class HingeAngleConstraint : PhysicsConstraint
+{
+    [SerializeField] private Float3 hingeAxis = Float3.UnitY;
+    [SerializeField] private float minAngle = -180.0f;
+    [SerializeField] private float maxAngle = 180.0f;
+    [SerializeField] private float softness = 0.001f;
+    [SerializeField] private float limitSoftness = 0.001f;
+    [SerializeField] private float biasFactor = 0.2f;
+    [SerializeField] private float limitBias = 0.1f;
+
+    private HingeAngle constraint;
+
+    /// <summary>
+    /// The hinge axis in local space of this rigidbody.
+    /// </summary>
+    public Float3 HingeAxis
+    {
+        get => hingeAxis;
+        set
+        {
+            hingeAxis = RequireAxis(value);
+            RecreateConstraint();
+        }
+    }
+
+    /// <summary>
+    /// Minimum angle in degrees. Default is -180.
+    /// </summary>
+    public float MinAngle
+    {
+        get => minAngle;
+        set
+        {
+            minAngle = value;
+            UpdateLimits();
+        }
+    }
+
+    /// <summary>
+    /// Maximum angle in degrees. Default is 180.
+    /// </summary>
+    public float MaxAngle
+    {
+        get => maxAngle;
+        set
+        {
+            maxAngle = value;
+            UpdateLimits();
+        }
+    }
+
+    /// <summary>
+    /// Softness of the constraint. Higher values make the constraint softer.
+    /// </summary>
+    public float Softness
+    {
+        get => softness;
+        set
+        {
+            softness = value;
+            if (IsLive(constraint)) constraint.Softness = value;
+        }
+    }
+
+    /// <summary>
+    /// Softness of the angle limit. Higher values make the limit softer.
+    /// </summary>
+    public float LimitSoftness
+    {
+        get => limitSoftness;
+        set
+        {
+            limitSoftness = value;
+            if (IsLive(constraint)) constraint.LimitSoftness = value;
+        }
+    }
+
+    /// <summary>
+    /// Bias factor for error correction. Higher values correct errors faster.
+    /// </summary>
+    public float BiasFactor
+    {
+        get => biasFactor;
+        set
+        {
+            biasFactor = value;
+            if (IsLive(constraint)) constraint.Bias = value;
+        }
+    }
+
+    /// <summary>
+    /// Bias factor for limit error correction.
+    /// </summary>
+    public float LimitBias
+    {
+        get => limitBias;
+        set
+        {
+            limitBias = value;
+            if (IsLive(constraint)) constraint.LimitBias = value;
+        }
+    }
+
+    /// <summary>
+    /// Gets the current hinge angle in degrees.
+    /// </summary>
+    public float Angle
+    {
+        get
+        {
+            if (!IsLive(constraint)) return 0.0f;
+            return constraint.Angle.Degree;
+        }
+    }
+
+    /// <summary>
+    /// Gets the accumulated impulse applied by this constraint.
+    /// </summary>
+    public Float3 Impulse
+    {
+        get
+        {
+            if (!IsLive(constraint)) return Float3.Zero;
+            Jitter2.LinearMath.JVector impulse = constraint.Impulse;
+            return impulse.ToProwl();
+        }
+    }
+
+    protected override Constraint GetConstraint() => constraint;
+
+    protected override void CreateConstraint(World world, RigidBody body1, RigidBody body2)
+    {
+        // Jitter drives and measures the connected side relative to this body, so the axis is reversed to
+        // make a positive motor, angle or distance mean this body moving along +axis.
+        Jitter2.LinearMath.JVector worldAxis = -LocalDirToWorld(hingeAxis, Body1.Transform);
+
+        constraint = world.CreateConstraint<HingeAngle>(body1, body2);
+
+        var limit = AngularLimit.FromDegree(minAngle, maxAngle);
+        constraint.Initialize(worldAxis, limit);
+
+        constraint.Softness = softness;
+        constraint.LimitSoftness = limitSoftness;
+        constraint.Bias = biasFactor;
+        constraint.LimitBias = limitBias;
+    }
+
+    protected override void DestroyConstraint()
+    {
+        RemoveConstraint(constraint);
+        constraint = null;
+    }
+
+    private void UpdateLimits()
+    {
+        if (IsLive(constraint))
+        {
+            var limit = AngularLimit.FromDegree(minAngle, maxAngle);
+            constraint.Limit = limit;
+        }
+    }
+
+    public override void DrawGizmos() => DrawJointMarker(WorldPivot);
+
+    // A door hinge: the pin it turns on, and the wedge of angle it is allowed to swing through.
+    public override void DrawGizmosSelected()
+    {
+        float scale = GizmoScale;
+        Float3 pivot = WorldPivot;
+        Float3 axis = WorldAxis(hingeAxis);
+
+        DrawJointMarker(pivot);
+        Debug.DrawAxisLine(pivot, axis, scale * 1.2f, AxisColor);
+        Debug.DrawWireCircle(pivot, axis, scale, AxisColor, 28);
+
+        // Measured from a fixed reference in the hinge plane, so dragging the limits sweeps the wedge.
+        Debug.PerpendicularAxes(axis, out Float3 zero, out _);
+        Debug.DrawArcRange(pivot, axis, zero, scale, minAngle, maxAngle, RangeColor, LimitColor);
+    }
+}

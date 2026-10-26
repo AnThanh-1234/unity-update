@@ -1,0 +1,88 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <Version>1.0</Version>
+    <NoWarn>8600;8601;8618;8602;8603;8604;8625</NoWarn>
+    <ApplicationIcon>prowl.ico</ApplicationIcon>
+
+    <!-- Copy each package's XML docs next to its dll, so the CLI api command can show docs for every library. -->
+    <CopyDocumentationFilesFromPackages>true</CopyDocumentationFilesFromPackages>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <OutputPath>../Build/Editor/Debug/</OutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <OutputPath>../Build/Editor/Release/</OutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Prowl.Runtime\Prowl.Runtime.csproj" />
+    <!-- EngineObject null-safety analyzer: analyzes the editor's own source, and (as a normal reference) is
+         copied to output + made available in-process so RoslynScriptBackend applies it to user scripts too. -->
+    <ProjectReference Include="..\Prowl.Analyzers\Prowl.Analyzers.csproj" OutputItemType="Analyzer" />
+  </ItemGroup>
+
+  <!-- Fix for Linux Builds -->
+  <PropertyGroup Condition="$([MSBuild]::IsOSPlatform('Linux')) and '$(RuntimeIdentifier)' == ''">
+    <RuntimeIdentifier>$(NETCoreSdkPortableRuntimeIdentifier)</RuntimeIdentifier>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+
+  <!-- Allow test project to access internal members (e.g. test-only sweep/eviction hooks) -->
+  <ItemGroup>
+    <InternalsVisibleTo Include="Prowl.Editor.Test" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ProwlLocalAnthology)' == 'true'">
+    <ProjectReference Include="$(AnthologyDir)Ember\Ember\Prowl.Ember.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Ember\Analyzers\Prowl.Ember.Analyzers.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Origami\Origami\Origami.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Origami\CSharp\Prowl.Origami.CSharp.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Origami\Graphite\Prowl.Origami.Graphite.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Graphite\Debugger\Prowl.Graphite.Debugger.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Graphite\Debugger\Viewer\Prowl.Graphite.Debugger.Viewer.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Photonic\Photonic\Photonic.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Rosetta\Rosetta\Rosetta.csproj" />
+    <ProjectReference Include="$(AnthologyDir)Unwrapper\Unwrapper\Unwrapper.csproj" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(ProwlLocalAnthology)' != 'true'">
+    <PackageReference Include="Prowl.Ember" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Ember.Analyzers" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Origami" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Origami.CSharp" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Origami.Graphite" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Graphite.Debugger" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Graphite.Debugger.Viewer" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Photonic" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Rosetta" Version="$(ProwlPackageVersion)" />
+    <PackageReference Include="Prowl.Unwrapper" Version="$(ProwlPackageVersion)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Resources\**" />
+    <!-- Named by their path inside a project, where AgentFiles writes them. -->
+    <EmbeddedResource Update="Resources\Agent\**" LogicalName="$([System.String]::Copy('%(RecursiveDir)').Replace('\', '/'))%(Filename)%(Extension)" />
+  </ItemGroup>
+
+  <!-- The prowl CLI ships next to the editor, and its wire types are shared from it. -->
+  <ItemGroup>
+    <ProjectReference Include="..\Prowl.Cli\Prowl.Cli.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Players\Desktop\Prowl.Player.Desktop.csproj" />
+  </ItemGroup>
+
+</Project>

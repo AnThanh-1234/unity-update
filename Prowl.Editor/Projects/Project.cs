@@ -1,0 +1,271 @@
+using System;
+using System.IO;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+
+using Prowl.Editor.Migration;
+
+namespace Prowl.Editor.Projects;
+
+/// <summary>
+/// Represents a Prowl project on disk.
+/// A project is a folder containing an Assets/ directory and a .prowl marker file.
+/// </summary>
+public class Project
+{
+    /// <summary> The engine version projects are saved with. A project from an older version is migrated when opened. </summary>
+    public static readonly EngineVersion CurrentVersion = EngineVersion.Parse("1.0");
+
+    /// <summary> Gets the currently active project, or null if no project is open. </summary>
+    public static Project? Current { get; private set; }
+
+    /// <summary> Gets the project name. </summary>
+    public string Name { get; private set; }
+    /// <summary> Gets the absolute root path of the project. </summary>
+    public string RootPath { get; private set; }
+    /// <summary> The engine version the project was last saved with. </summary>
+    public EngineVersion Version { get; private set; } = CurrentVersion;
+    /// <summary> How many of the migration steps of <see cref="Version"/> the project has been through. </summary>
+    public int AppliedSteps { get; private set; } = ProjectMigration.StepCount(CurrentVersion);
+
+    public bool IsFromNewerEngine => Version > CurrentVersion || (Version == CurrentVersion && AppliedSteps > ProjectMigration.StepCount(CurrentVersion));
+    public bool NeedsMigration => !IsFromNewerEngine && ProjectMigration.PendingSteps(this).Count > 0;
+
+    // Standard directories
+    public string AssetsPath => Path.Combine(RootPath, "Assets");
+    public string LibraryPath => Path.Combine(RootPath, "Library");
+    public string CachePath => Path.Combine(RootPath, "Library", "cache");
+    public string ThumbnailsPath => Path.Combine(RootPath, "Library", "thumbnails");
+    public string ProjectSettingsPath => Path.Combine(RootPath, "ProjectSettings");
+    public string BackupsPath => Path.Combine(RootPath, "Backups");
+    public string PackagesPath => Path.Combine(RootPath, "Packages");
+    public string TempPath => Path.Combine(RootPath, "Temp");
+    public string LogsPath => Path.Combine(RootPath, "Logs");
+    public string ProwlFilePath => Path.Combine(RootPath, $"{Name}.prowl");
+    public string MetadataDbPath => Path.Combine(LibraryPath, "metadata.db");
+    public string EditorStatePath => Path.Combine(LibraryPath, "EditorState.json");
+
+    // Build
+    public string BuildTempPath => Path.Combine(TempPath, "PlayerBuild");
+
+    // Script compilation
+    public string ScriptAssemblyPath => Path.Combine(LibraryPath, "ScriptAssemblies");
+    public string GameAssemblyPath => Path.Combine(ScriptAssemblyPath, $"{Name}.Game.dll");
+    public string EditorAssemblyPath => Path.Combine(ScriptAssemblyPath, $"{Name}.Editor.dll");
+    public string GameCsprojPath => Path.Combine(RootPath, $"{Name}.Game.csproj");
+    public string EditorCsprojPath => Path.Combine(RootPath, $"{Name}.Editor.csproj");
+    public string ProjectSolutionPath => Path.Combine(RootPath, $"{Name}.slnx");
+
+    private Project(string rootPath, string name)
+    {
+        RootPath = Path.GetFullPath(rootPath);
+        Name = name;
+    }
+
+    /// <summary> Creates a new project in a subfolder of parentFolder. Throws InvalidOperationException if the target directory already exists and is not empty. </summary>
+    public static Project Create(string parentFolder, string projectName)
+    {
+        string rootPath = Path.Combine(parentFolder, projectName);
+
+        if (Directory.Exists(rootPath) && Directory.GetFileSystemEntries(rootPath).Length > 0)
+            throw new InvalidOperationException($"Directory '{rootPath}' already exists and is not empty.");
+
+        var project = new Project(rootPath, projectName);
+        project.EnsureDirectories();
+        project.WriteProwlFile();
+
+        // Create a default .gitignore
+        string gitignore = Path.Combine(rootPath, ".gitignore");
+        if (!File.Exists(gitignore))
+        {
+            File.WriteAllText(gitignore,
+                "Library/\nTemp/\nLogs/\nBackups/\n*.csproj\n*.sln\n*.slnx\n.vs/\nbin/\nobj/\n# MacOS\n.DS_Store\n");
+        }
+
+        // Non-destructive MSBuild customization surface. The generated .csproj files are rewritten on
+        // every recompile, so this checked-in file is where users add their own references.
+        string buildProps = Path.Combine(rootPath, "Directory.Build.props");
+        if (!File.Exists(buildProps))
+            File.WriteAllText(buildProps, DirectoryBuildPropsTemplate);
+
+        return project;
+    }
+
+    /// <summary>
+    /// Open an existing project from a root folder or .prowl file path.
+    /// </summary>
+    public static Project Open(string path)
+    {
+        string rootPath;
+
+        if (File.Exists(path) && path.EndsWith(".prowl", StringComparison.OrdinalIgnoreCase))
+        {
+            rootPath = Path.GetDirectoryName(path)!;
+        }
+        else if (Directory.Exists(path))
+        {
+            rootPath = path;
+        }
+        else
+        {
+            throw new DirectoryNotFoundException($"Project path not found: {path}");
+        }
+
+        rootPath = Path.GetFullPath(rootPath);
+
+        // Validate the project has an Assets/ folder
+        string assetsDir = Path.Combine(rootPath, "Assets");
+        if (!Directory.Exists(assetsDir))
+            throw new InvalidOperationException($"Not a valid Prowl project: missing Assets/ folder in '{rootPath}'");
+
+        (string? name, string versionText, int? appliedSteps) = ReadProwlFile(rootPath);
+        if (!EngineVersion.TryParse(versionText, out EngineVersion version))
+            throw new InvalidOperationException($"'{rootPath}' was saved with an unrecognized engine version '{versionText}'");
+
+        var project = new Project(rootPath, name ?? Path.GetFileName(rootPath))
+        {
+            Version = version,
+            AppliedSteps = appliedSteps ?? ProjectMigration.StepCount(version),
+        };
+        project.EnsureDirectories();
+
+        // Write .prowl file if missing
+        if (name == null)
+            project.WriteProwlFile();
+
+        return project;
+    }
+
+    /// <summary> The version a project folder was last saved with, without opening it. </summary>
+    public static string ReadVersion(string rootPath) => ReadProwlFile(rootPath).Version;
+
+    // A project without a .prowl file, or one that predates versions, is from before versions were written.
+    // Without appliedSteps, the project went through every step of its version.
+    private static (string? Name, string Version, int? AppliedSteps) ReadProwlFile(string rootPath)
+    {
+        string[] prowlFiles = Directory.Exists(rootPath) ? Directory.GetFiles(rootPath, "*.prowl") : [];
+        if (prowlFiles.Length == 0) return (null, "", null);
+
+        string name = Path.GetFileName(rootPath);
+        string version = "";
+        int? appliedSteps = null;
+        try
+        {
+            using var doc = JsonDocument.Parse(File.ReadAllText(prowlFiles[0]));
+            if (doc.RootElement.TryGetProperty("name", out JsonElement nameProp))
+                name = nameProp.GetString() ?? name;
+            if (doc.RootElement.TryGetProperty("version", out JsonElement versionProp))
+                version = versionProp.GetString() ?? "";
+            if (doc.RootElement.TryGetProperty("appliedSteps", out JsonElement stepsProp) && stepsProp.TryGetInt32(out int steps))
+                appliedSteps = steps;
+        }
+        catch { }
+        return (name, version, appliedSteps);
+    }
+
+    /// <summary> Records that the project is now in the current version's format. </summary>
+    public void MarkCurrent() => MarkMigrated(CurrentVersion, ProjectMigration.StepCount(CurrentVersion));
+
+    /// <summary> Records that the project has been through the first appliedSteps steps of version. </summary>
+    public void MarkMigrated(EngineVersion version, int appliedSteps)
+    {
+        Version = version;
+        AppliedSteps = appliedSteps;
+        WriteProwlFile();
+    }
+
+    /// <summary>
+    /// Set this project as the currently active project.
+    /// </summary>
+    /// <param name="addToRecent">
+    /// When true (default) the project is added to the user's recent-projects list. Tests and other
+    /// non-interactive callers pass false to avoid polluting that list.
+    /// </param>
+    public void SetActive(bool addToRecent = true)
+    {
+        if (Version < CurrentVersion && !NeedsMigration)
+            MarkCurrent();
+
+        Current = this;
+        if (addToRecent)
+            RecentProjects.AddRecent(RootPath, Name);
+        Runtime.Debug.Log($"Opened project: {Name} at {RootPath}");
+    }
+
+    /// <summary>
+    /// Clears the active project (<see cref="Current"/> becomes null). Used when closing a project
+    /// or tearing down a test environment.
+    /// </summary>
+    public static void CloseCurrent() => Current = null;
+
+    /// <summary>
+    /// Check if a directory looks like a valid Prowl project.
+    /// </summary>
+    public static bool IsValidProject(string path)
+    {
+        if (!Directory.Exists(path)) return false;
+        return Directory.Exists(Path.Combine(path, "Assets"));
+    }
+
+    private void EnsureDirectories()
+    {
+        Directory.CreateDirectory(AssetsPath);
+        Directory.CreateDirectory(LibraryPath);
+        Directory.CreateDirectory(CachePath);
+        Directory.CreateDirectory(ThumbnailsPath);
+        Directory.CreateDirectory(ProjectSettingsPath);
+        Directory.CreateDirectory(PackagesPath);
+        Directory.CreateDirectory(TempPath);
+        Directory.CreateDirectory(LogsPath);
+        Directory.CreateDirectory(ScriptAssemblyPath);
+    }
+
+    private void WriteProwlFile()
+    {
+        JsonObject data = (File.Exists(ProwlFilePath) ? TryParse(File.ReadAllText(ProwlFilePath)) : null) ?? [];
+        data["name"] = Name;
+        data["engine"] = "Prowl";
+        data["version"] = Version.ToString();
+        data["appliedSteps"] = AppliedSteps;
+        data["created"] ??= DateTime.UtcNow.ToString("o");
+
+        File.WriteAllText(ProwlFilePath, data.ToJsonString(new JsonSerializerOptions { WriteIndented = true }));
+    }
+
+    private static JsonObject? TryParse(string json)
+    {
+        try { return JsonNode.Parse(json) as JsonObject; }
+        catch (JsonException) { return null; }
+    }
+
+    private const string DirectoryBuildPropsTemplate =
+        """
+        <Project>
+
+          <!--
+            Directory.Build.props (Prowl user MSBuild customization)
+
+            This is where you add NuGet packages for your game. Prowl regenerates the .csproj files on
+            every recompile, but never touches this file, and MSBuild imports it into every generated
+            user project automatically (editor script assemblies and the shipped player build). Add
+            PackageReference, ProjectReference, analyzers, or any other MSBuild here.
+
+            Packages in the default group below are available to your scripts in the editor AND bundled
+            into player builds. To keep a package out of player builds (editor tooling only), put it in
+            the editor group, which is scoped to the *.Editor assembly by name.
+          -->
+
+          <!-- Available everywhere: editor scripts, runtime scripts, and shipped player builds. -->
+          <ItemGroup>
+            <!-- <PackageReference Include="Newtonsoft.Json" Version="13.0.3" /> -->
+            <!-- <ProjectReference Include="..\Shared\Shared.csproj" /> -->
+          </ItemGroup>
+
+          <!-- Editor only: never shipped in a player build. -->
+          <ItemGroup Condition="$(MSBuildProjectName.EndsWith('.Editor'))">
+            <!-- <PackageReference Include="ImGui.NET" Version="1.91.6.1" /> -->
+          </ItemGroup>
+
+        </Project>
+        """;
+}

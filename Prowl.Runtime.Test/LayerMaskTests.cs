@@ -1,0 +1,105 @@
+﻿// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using Xunit;
+
+namespace Prowl.Runtime.Test;
+
+/// <summary>Tests for the <see cref="LayerMask"/> bit operations.</summary>
+public class LayerMaskTests
+{
+    [Fact]
+    public void SetHasRemoveLayer()
+    {
+        LayerMask m = LayerMask.Nothing;
+        Assert.False(m.HasLayer(3));
+
+        m.SetLayer(3);
+        Assert.True(m.HasLayer(3));
+        Assert.False(m.HasLayer(4));
+
+        m.RemoveLayer(3);
+        Assert.False(m.HasLayer(3));
+    }
+
+    // A serialized LayerMask nobody has touched should let everything through, not silently match
+    // nothing, so the stored bits are exclusions and default is Everything.
+    [Fact]
+    public void Default_IsEverything()
+    {
+        LayerMask fresh = default;
+
+        Assert.True(fresh.HasLayer(0));
+        Assert.True(fresh.HasLayer(31));
+        Assert.Equal(uint.MaxValue, fresh.Mask);
+        Assert.Equal(LayerMask.Everything, fresh);
+    }
+
+    [Fact]
+    public void EverythingAndNothing()
+    {
+        Assert.True(LayerMask.Everything.HasLayer(0));
+        Assert.True(LayerMask.Everything.HasLayer(31));
+        Assert.False(LayerMask.Nothing.HasLayer(0));
+        Assert.False(LayerMask.Nothing.HasLayer(15));
+    }
+
+    [Fact]
+    public void SetLayer31_TopBit_IsDetectedInIsolation()
+    {
+        // Isolates the top bit: Everything (all bits set) can't distinguish a signed 1<<31 shift bug,
+        // but setting only layer 31 and checking it directly does (the regression this guards).
+        LayerMask m = LayerMask.Nothing;
+        m.SetLayer(31);
+
+        Assert.True(m.HasLayer(31));
+        Assert.False(m.HasLayer(30));
+        Assert.Equal(0x80000000u, m.Mask);
+    }
+
+    [Fact]
+    public void OrCombinesMasks()
+    {
+        LayerMask a = LayerMask.Nothing; a.SetLayer(1);
+        LayerMask b = LayerMask.Nothing; b.SetLayer(2);
+
+        LayerMask or = a | b;
+
+        Assert.True(or.HasLayer(1));
+        Assert.True(or.HasLayer(2));
+        Assert.False(or.HasLayer(3));
+    }
+
+    [Fact]
+    public void AndFiltersMasks()
+    {
+        LayerMask a = LayerMask.Nothing; a.SetLayer(1);
+
+        LayerMask and = LayerMask.Everything & a;
+
+        Assert.True(and.HasLayer(1));
+        Assert.False(and.HasLayer(2));
+    }
+
+    [Fact]
+    public void Clear_ResetsToZero()
+    {
+        LayerMask m = LayerMask.Nothing;
+        m.SetLayer(5);
+        m.SetLayer(9);
+
+        m.Clear();
+
+        Assert.Equal(0u, m.Mask);
+    }
+
+    [Fact]
+    public void SettingSameLayerTwice_IsIdempotent()
+    {
+        LayerMask m = LayerMask.Nothing;
+        m.SetLayer(7);
+        uint once = m.Mask;
+        m.SetLayer(7);
+        Assert.Equal(once, m.Mask);
+    }
+}

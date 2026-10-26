@@ -1,0 +1,241 @@
+// This file is part of the Prowl Game Engine
+// Licensed under the MIT License. See the LICENSE file in the project root for details.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Reflection;
+
+using Prowl.Editor.GUI;
+using Prowl.Editor.Theming;
+using Prowl.OrigamiUI;
+using Prowl.PaperUI;
+using Prowl.PaperUI.LayoutEngine;
+using Prowl.Runtime;
+
+using Color = System.Drawing.Color;
+
+namespace Prowl.Editor.GUI.PropertyEditors;
+
+/// <summary>
+/// Inspector for <see cref="ProwlAction"/> - the persistent call list. Each row picks a scene
+/// GameObject, chooses a method / settable property / field on it (or any of its components) via
+/// reflection, and supplies one basic argument.
+/// </summary>
+[CustomPropertyEditor(typeof(ProwlAction))]
+public class ProwlActionPropertyEditor : PropertyEditor
+{
+    // One invokable member surfaced in the function dropdown, tagged with the object that owns it.
+    private readonly struct MemberOption
+    {
+        public readonly string Display;
+        public readonly EngineObject Target;
+        public readonly string Name;
+        public readonly ProwlActionArgType ArgType;
+
+        public MemberOption(string display, EngineObject target, string name, ProwlActionArgType argType)
+        {
+            Display = display; Target = target; Name = name; ArgType = argType;
+        }
+    }
+
+    public override void OnGUI(Paper paper, string id, string label, object? value, Action<object?> onChange, int depth)
+    {
+        var action = value as ProwlAction;
+        if (action == null)
+        {
+            action = new ProwlAction();
+            onChange(action);
+        }
+
+        Prowl.Scribe.FontFile? font = EditorTheme.Font;
+        if (font == null) return;
+        Prowl.Scribe.FontFile semi = EditorTheme.FontSemiBold ?? font;
+        Prowl.Scribe.FontFile mono = EditorTheme.FontMono ?? font;
+
+        List<ProwlCall> calls = action.Calls;
+        string title = string.IsNullOrEmpty(label) ? "Actions" : label;
+
+        // Outer card - mirrors the PropertyGrid collection editor: rounded bordered container with a
+        // titled header, a padded body of per-element cards, and an accent "add" footer.
+        using (paper.Column($"{id}_box").Height(UnitValue.Auto)
+            .Rounded(Origami.Current.Metrics.ContainerRounding).BorderColor(EditorTheme.BorderSoft).BorderWidth(1).Clip().Enter())
+        {
+            using (paper.Row($"{id}_hdr").Height(28).RoundedTop(Origami.Current.Metrics.ContainerRounding).Padding(10, 10, 0, 0)
+                .BackgroundColor(EditorTheme.Glass).Enter())
+            {
+                paper.Box($"{id}_hl").Height(28).IsNotInteractable()
+                    .Text($"{title}   ({calls.Count})", semi).TextColor(EditorTheme.Ink500)
+                    .FontSize(EditorTheme.FontSize).Alignment(TextAlignment.MiddleLeft);
+            }
+            EditorGUI.Divider(paper, $"{id}_hd");
+
+            using (paper.Column($"{id}_body").Height(UnitValue.Auto).Padding(6, 6, 6, 6).Gap(6).Enter())
+            {
+                if (calls.Count == 0)
+                    paper.Box($"{id}_empty").Height(24).IsNotInteractable()
+                        .Text("No calls - add one below", font).TextColor(EditorTheme.InkFaint)
+                        .FontSize(EditorTheme.FontSizeSmall).Alignment(TextAlignment.MiddleCenter);
+
+                for (int i = 0; i < calls.Count; i++)
+                {
+                    int idx = i;
+                    DrawCallCard(paper, $"{id}_c{idx}", idx, calls[idx], mono,
+                        changed: () => onChange(action),
+                        remove: () => { calls.RemoveAt(idx); onChange(action); });
+                }
+
+                Origami.Button(paper, $"{id}_add", $"{EditorIcons.Plus}  Add Call", () => { calls.Add(new ProwlCall()); onChange(action); })
+                    .Primary().Ghost().FullWidth().Height(26).Show();
+            }
+        }
+    }
+
+    private static void DrawCallCard(Paper paper, string id, int index, ProwlCall call,
+        Prowl.Scribe.FontFile mono, Action changed, Action remove)
+    {
+
+        // The stored Target is the exact object the call runs on (a GameObject or one of its
+        // Components); the picker edits the owning GameObject, which we recover from either.
+        GameObject? ownerGo = call.Target as GameObject;
+        Component? ownerComp = call.Target as Component;
+        GameObject? owner = ownerGo.IsValid() ? ownerGo : (ownerComp.IsValid() ? ownerComp.GameObject : null);
+
+        using (paper.Column(id).Height(UnitValue.Auto)
+            .Rounded(Origami.Current.Metrics.Rounding).BorderColor(EditorTheme.BorderSoft).BorderWidth(1)
+            .BackgroundColor(Color.FromArgb(8, 255, 255, 255)).Clip().Enter())
+        {
+            // Card header: index label + delete button.
+            using (paper.Row($"{id}_ch").Height(26).Padding(8, 6, 0, 0).Gap(6).Enter())
+            {
+                paper.Box($"{id}_ct").Height(26).IsNotInteractable()
+                    .Text($"Call {index}", mono).TextColor(EditorTheme.InkDim)
+                    .FontSize(EditorTheme.FontSizeSmall).Alignment(TextAlignment.MiddleLeft);
+                using (paper.Box($"{id}_cx_w").Width(UnitValue.Auto).Height(UnitValue.Auto).Margin(0, 0, UnitValue.StretchOne, UnitValue.StretchOne).Enter())
+                    Origami.IconButton(paper, $"{id}_cx", EditorIcons.Xmark_I, remove).Small().Width(20).Height(20).Ghost().Show();
+            }
+            EditorGUI.Divider(paper, $"{id}_cd");
+
+            // Card body: target, function, argument.
+            using (paper.Column($"{id}_cb").Height(UnitValue.Auto).Padding(2, 2, 4, 4).Enter())
+            {
+                PropertyGridUtils.DrawField(paper, $"{id}_tgt", "Target", typeof(GameObject), owner, v =>
+                {
+                    call.Target = v as GameObject;
+                    call.Member = "";
+                    call.ArgType = ProwlActionArgType.None;
+                    changed();
+                }, 0);
+
+                if (owner != null)
+                {
+                    List<MemberOption> members = BuildMembers(owner);
+                    string[] names = [.. members.Select(m => m.Display)];
+                    int sel = members.FindIndex(m => ReferenceEquals(m.Target, call.Target) && m.Name == call.Member);
+
+                    EditorGUI.Row(paper, $"{id}_fn", "Function", () =>
+                        Origami.Dropdown(paper, $"{id}_fnv", sel, i =>
+                        {
+                            if (i < 0 || i >= members.Count) return;
+                            MemberOption m = members[i];
+                            call.Target = m.Target;
+                            call.Member = m.Name;
+                            call.ArgType = m.ArgType;
+                            changed();
+                        }, names).Placeholder("No Function").Searchable().Show());
+
+                    DrawArg(paper, $"{id}_arg", call, changed);
+                }
+            }
+        }
+    }
+
+    private static void DrawArg(Paper paper, string id, ProwlCall call, Action changed)
+    {
+        switch (call.ArgType)
+        {
+            case ProwlActionArgType.Bool:
+                EditorGUI.Row(paper, id, "Value", () =>
+                    Origami.Checkbox(paper, $"{id}_v", call.BoolArg, v => { call.BoolArg = v; changed(); }).Show());
+                break;
+            case ProwlActionArgType.Int:
+                EditorGUI.Row(paper, id, "Value", () =>
+                    Origami.NumericField<int>(paper, $"{id}_v", call.IntArg, v => { call.IntArg = v; changed(); }).Show());
+                break;
+            case ProwlActionArgType.Float:
+                EditorGUI.Row(paper, id, "Value", () =>
+                    Origami.NumericField<float>(paper, $"{id}_v", call.FloatArg, v => { call.FloatArg = v; changed(); }).Show());
+                break;
+            case ProwlActionArgType.String:
+                EditorGUI.Row(paper, id, "Value", () =>
+                    Origami.TextField(paper, $"{id}_v", call.StringArg, v => { call.StringArg = v; changed(); }).CommitOnEnter().Show());
+                break;
+            case ProwlActionArgType.Object:
+                PropertyGridUtils.DrawField(paper, $"{id}_v", "Value", typeof(EngineObject), call.ObjectArg,
+                    v => { call.ObjectArg = v as EngineObject; changed(); }, 0);
+                break;
+        }
+    }
+
+    // ---- Reflection: build the function dropdown from the GameObject + each of its components ----
+
+    private static List<MemberOption> BuildMembers(GameObject go)
+    {
+        var list = new List<MemberOption>();
+        AddMembers(list, go, "GameObject", go);
+        foreach (Component comp in go.GetComponents<Component>())
+        {
+            if (comp == null) continue;
+            AddMembers(list, comp, comp.GetType().Name, comp);
+        }
+        return list;
+    }
+
+    private static void AddMembers(List<MemberOption> list, EngineObject target, string group, object host)
+    {
+        Type t = host.GetType();
+        const BindingFlags flags = BindingFlags.Public | BindingFlags.Instance;
+
+        // Action-style methods only: void return, no property accessors/operators/generics, and either
+        // no parameter or a single simple one. A method that returns a value is a query, not an action,
+        // so it's hidden.
+        foreach (MethodInfo m in t.GetMethods(flags))
+        {
+            if (m.IsSpecialName || m.IsGenericMethodDefinition || m.ContainsGenericParameters) continue;
+            // Skip engine plumbing - members that come from EngineObject (or above), even when a derived
+            // type overrides them (e.g. Dispose). GetBaseDefinition walks overrides back to their origin.
+            if (IsFromEngineObject(m.GetBaseDefinition().DeclaringType)) continue;
+            if (m.ReturnType != typeof(void)) continue;
+
+            ParameterInfo[] ps = m.GetParameters();
+            if (ps.Length == 0)
+                list.Add(new MemberOption($"{group}/{m.Name} ()", target, m.Name, ProwlActionArgType.None));
+            else if (ps.Length == 1 && ProwlActionArg.TryFromType(ps[0].ParameterType, out ProwlActionArgType at))
+                list.Add(new MemberOption($"{group}/{m.Name} ({ProwlActionArg.Label(at)})", target, m.Name, at));
+        }
+
+        // Settable properties of a supported type.
+        foreach (PropertyInfo p in t.GetProperties(flags))
+        {
+            if (!p.CanWrite || p.GetIndexParameters().Length > 0) continue;
+            MethodInfo? accessor = p.GetMethod ?? p.SetMethod;
+            if (accessor != null && IsFromEngineObject(accessor.GetBaseDefinition().DeclaringType)) continue;
+            if (ProwlActionArg.TryFromType(p.PropertyType, out ProwlActionArgType at) && at != ProwlActionArgType.None)
+                list.Add(new MemberOption($"{group}/{p.Name} = ({ProwlActionArg.Label(at)})", target, p.Name, at));
+        }
+
+        // Public fields of a supported type.
+        foreach (FieldInfo f in t.GetFields(flags))
+        {
+            if (IsFromEngineObject(f.DeclaringType)) continue;
+            if (ProwlActionArg.TryFromType(f.FieldType, out ProwlActionArgType at) && at != ProwlActionArgType.None)
+                list.Add(new MemberOption($"{group}/{f.Name} = ({ProwlActionArg.Label(at)})", target, f.Name, at));
+        }
+    }
+
+    // True if a member introduced on this type is engine plumbing: declared on EngineObject itself or
+    // any of its base types (object, IDisposable-implementing bases, etc.). Pass the ORIGIN type - i.e.
+    // for methods/properties, the declaring type of GetBaseDefinition() so overrides resolve to source.
+    private static bool IsFromEngineObject(Type? originType)
+        => originType != null && originType.IsAssignableFrom(typeof(EngineObject));
+}
