@@ -130,6 +130,9 @@ public struct ModelImporterSettings
     /// its own resolver that only ever produces database textures, with no decode of its own.</summary>
     public IModelTextureResolver? TextureResolver;
 
+    /// <summary>Finds the files a model names, such as its textures. Null resolves them against the model's own folder only.</summary>
+    public Clay.Importer.IFileResolver? FileResolver;
+
     public ModelImporterSettings() { }
 }
 

@@ -19,7 +19,10 @@ public class EditorModelImporter : AssetImporter
     // 8: normals now come from Clay, which splits vertices on hard edges.
     // 12: Clay negates X instead of Z, so models face +Z as authored, and cameras and lights sit on a child.
     // 13: only cameras and spot lights sit on a turned child, directional and point lights stay on the node.
-    private const int BaseVersion = 16;
+    // 17: the one clip of a "Model@Take" file is named after the file.
+    // 18: a texture missing at its stored path is looked for in Textures folders, and FBX surfaces default to non-metal.
+    // 19: Stingray PBS materials from 3ds Max keep their maps.
+    private const int BaseVersion = 19;
     /// <summary> Combined version: the importer's own base version plus the aggregate version from MeshFeatureRegistry, so any change to mesh feature generation invalidates the cache. </summary>
     public override int Version => BaseVersion + MeshFeatureRegistry.AggregateVersion;
 
@@ -38,7 +41,11 @@ public class EditorModelImporter : AssetImporter
             // textures resolve to the already-imported project asset by path/GUID, and embedded ones
             // are registered as sub-assets. Unconditional, not settings-gated: holds for every
             // editor import.
-            var importSettings = new ModelImporterSettings { TextureResolver = new EditorModelTextureResolver(ctx) };
+            var importSettings = new ModelImporterSettings
+            {
+                TextureResolver = new EditorModelTextureResolver(ctx),
+                FileResolver = new ProjectFileResolver(Project.Current?.AssetsPath),
+            };
             if (ctx.Settings != null)
             {
                 EchoObject s = ctx.Settings;
@@ -176,6 +183,50 @@ public class EditorModelImporter : AssetImporter
         MeshFeatureRegistry.PopulateDefaultSettings(s);
         return s;
     }
+}
+
+/// <summary>Finds the files a model names on disk, with a fallback search inside the project's Assets folder.</summary>
+internal sealed class ProjectFileResolver : Clay.Importer.IFileResolver
+{
+    private static readonly string[] s_textureFolders = ["", "Textures", "textures", "Texture", "Materials"];
+
+    private readonly Clay.Importer.DefaultFileResolver _default = new();
+    private readonly string? _assetsRoot;
+
+    public ProjectFileResolver(string? assetsRoot)
+    {
+        _assetsRoot = string.IsNullOrEmpty(assetsRoot) ? null : Path.GetFullPath(assetsRoot).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+    }
+
+    /// <summary>
+    /// The path the model stored, and failing that the file by name in the model's folder or a Textures
+    /// folder beside it or beside any folder above it, up to Assets. Exporters often store a path from the
+    /// artist's machine, and Unity packages keep models and textures in sibling folders.
+    /// </summary>
+    public string? Resolve(string modelPath, string relativePath)
+    {
+        string? found = _default.Resolve(modelPath, relativePath);
+        if (found != null || _assetsRoot == null) return found;
+
+        string name = Path.GetFileName(relativePath.Replace('\\', '/'));
+        if (name.Length == 0) return null;
+
+        for (string? dir = Path.GetDirectoryName(Path.GetFullPath(modelPath)); dir != null && IsUnderAssets(dir); dir = Path.GetDirectoryName(dir))
+            foreach (string folder in s_textureFolders)
+            {
+                string candidate = Path.Combine(dir, folder, name);
+                if (File.Exists(candidate)) return candidate;
+            }
+        return null;
+    }
+
+    private bool IsUnderAssets(string dir)
+        => dir.Equals(_assetsRoot, StringComparison.OrdinalIgnoreCase)
+        || dir.StartsWith(_assetsRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+
+    public Stream OpenRead(string absolutePath) => _default.OpenRead(absolutePath);
+    public byte[] ReadAllBytes(string absolutePath) => _default.ReadAllBytes(absolutePath);
+    public bool Exists(string absolutePath) => _default.Exists(absolutePath);
 }
 
 /// <summary>

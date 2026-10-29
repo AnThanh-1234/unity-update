@@ -38,6 +38,9 @@ public class HierarchyPanel : DockPanel
 
     private const float ToolbarHeight = 30f;
 
+    /// <summary>Whether the files being dropped from the OS are over the hierarchy. Read by <see cref="ExternalAssetDrop"/>.</summary>
+    internal static bool ExternalDropHovered;
+
     // Drag-drop state
     private bool _assetDropTarget;
     private enum DropPosition { Into, Above, Below }
@@ -219,6 +222,7 @@ public class HierarchyPanel : DockPanel
 
                 // Track if the background (hier_bg) is hovered for drop-on-empty-space
                 bool bgHovered = paper.IsParentHovered;
+                if (ExternalAssetDrop.IsResolvingDropTarget) ExternalDropHovered = bgHovered;
 
                 // Hierarchy keyboard shortcuts
                 if (bgHovered && !ShortcutManager.IsRebinding)

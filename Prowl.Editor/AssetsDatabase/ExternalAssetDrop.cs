@@ -64,6 +64,7 @@ public static class ExternalAssetDrop
             if (!_pending.TryDequeue(out _resolving)) return;
             _resolveFrames = 0;
             ProjectPanel.Instance?.ClearDropHover();
+            HierarchyPanel.ExternalDropHovered = false;
         }
         if (++_resolveFrames < 3) return;
 
@@ -75,6 +76,24 @@ public static class ExternalAssetDrop
 
     private static void HandleDrop(string[] paths, string? targetFolder)
     {
+        // A .unitypackage is unpacked rather than copied, wherever it is dropped. Dropped on the
+        // hierarchy, its models are also placed in the scene with their animations.
+        var rest = new List<string>(paths.Length);
+        foreach (string path in paths)
+        {
+            if (path.EndsWith(".unitypackage", StringComparison.OrdinalIgnoreCase) && File.Exists(path))
+            {
+                bool buildScene = HierarchyPanel.ExternalDropHovered;
+                if (!buildScene)
+                    Runtime.Debug.Log($"[UnityPackage] '{Path.GetFileName(path)}' was dropped outside the Hierarchy, so it is only imported. Drop it on the Hierarchy to also place its models in the scene.");
+                UnityPackageExtractor.StartImport(path, buildScene);
+            }
+            else
+                rest.Add(path);
+        }
+        if (rest.Count == 0) return;
+        paths = rest.ToArray();
+
         EditorAssetBackend db = EditorAssetBackend.Instance!;
         string assetsPath = Project.Current!.AssetsPath;
 

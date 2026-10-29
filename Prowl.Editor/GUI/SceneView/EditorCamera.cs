@@ -554,6 +554,10 @@ public class EditorCamera
         float dist = radius / MathF.Tan(fovRad * 0.5f) + radius;
         dist = MathF.Max(dist, 0.5f);
 
+        // Framing something bigger than the view reaches (a whole city model) would leave it past the far
+        // plane, so the view would go empty. Push the plane out far enough to see all of it.
+        if (dist + radius > _perspectiveFarClip) FarClip = (dist + radius) * 1.5f;
+
         // A UI-only selection is a flat rect, so the view swings around to face it from whichever side
         // the camera is already on. Anything with geometry keeps the angle it was viewed from.
         if (anyUI && !anyRenderer && Float3.LengthSquared(uiNormal) > 1e-8f)

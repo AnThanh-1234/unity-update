@@ -36,7 +36,7 @@ internal static class ClayBackedImporter
     public static ModelImportResult Import(FileInfo assetPath, ModelImporterSettings settings)
     {
         string ext = assetPath.Extension.ToLowerInvariant();
-        Model clayModel = Clay.Importer.ModelImporter.Load(assetPath.FullName, MapSettings(settings, ext));
+        Model clayModel = Clay.Importer.ModelImporter.Load(assetPath.FullName, MapSettings(settings, ext), settings.FileResolver);
         return Bake(clayModel, Path.GetFileNameWithoutExtension(assetPath.Name), settings);
     }
 
@@ -285,8 +285,14 @@ internal static class ClayBackedImporter
             ModelRigBuilder.Rig rig = ModelRigBuilder.BuildRig(clayModel, nodeGOs, rootGO);
             avatar = BuildAvatar(rig, settings, modelName);
             if (settings.ImportAnimations)
+            {
+                // Unity's "Model@Take.fbx" convention keeps one clip per file and names it by the file, since the
+                // take inside is usually a generic "Take 001" or "mixamo.com".
+                int at = modelName.IndexOf('@');
+                string? fileClipName = at >= 0 && at < modelName.Length - 1 && clayModel.AnimationClips.Count == 1 ? modelName[(at + 1)..] : null;
                 foreach (ClayAnim clip in clayModel.AnimationClips)
-                    animations.Add(BuildClip(clip, clayModel, rig, avatar, settings));
+                    animations.Add(BuildClip(clip, clayModel, rig, avatar, settings, fileClipName));
+            }
 
             Animator animator = rootGO.AddComponent<Animator>();
             animator.Avatar = avatar;
@@ -696,13 +702,14 @@ internal static class ClayBackedImporter
         return Avatar.CreateHumanoid(skeleton, description, name);
     }
 
-    private static PAnim BuildClip(ClayAnim source, Clay.Model clayModel, ModelRigBuilder.Rig rig, Avatar avatar, ModelImporterSettings settings)
+    private static PAnim BuildClip(ClayAnim source, Clay.Model clayModel, ModelRigBuilder.Rig rig, Avatar avatar, ModelImporterSettings settings, string? defaultName = null)
     {
         string sourceName = string.IsNullOrEmpty(source.Name) ? "Animation" : source.Name;
         ModelClipSettings overrides = default;
         settings.ClipOverrides?.TryGetValue(sourceName, out overrides);
 
-        string name = string.IsNullOrWhiteSpace(overrides.Name) ? sourceName : overrides.Name!;
+        // Overrides stay keyed by the take, so a rename in the inspector still wins over the default name.
+        string name = !string.IsNullOrWhiteSpace(overrides.Name) ? overrides.Name! : defaultName ?? sourceName;
 
         // A humanoid moves by its hips; any other rig by the highest bone the clip moves.
         int body = avatar.Runtime is { IsHuman: true } && avatar.Description is { } description
